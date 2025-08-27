@@ -53,23 +53,26 @@ class FoldCloth1Env(ClothEnv):
 
 
 if __name__ == "__main__":
-    env = FoldCloth1Env(batch_size=1)
+    env = FoldCloth1Env(batch_size=10000)
     env.seed(1)
     # env.collect_goal()
     # env.collect_expert_demo(10)
 
     obs, state = env.reset(env.simulator.key_global)
 
-    # actions = np.zeros((env.batch_size, 6))
-    # env.step_diff(actions, state)  # to compile the jax module
+    actions = np.zeros((env.batch_size, 6))
+    env.step_diff(actions, state)  # to compile the jax module
 
     # interactive test
     print("time start")
     start_time = time.time()
     for _ in range(100):
-        actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
+        # actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
         # actions = env.get_random_fold_action(state)
-        # obs, reward, done, info = env.step_diff(actions, state)
-        obs, reward, done, info = env.step_with_render(actions, state)
+        actions = np.zeros((env.batch_size, 6))
+
+        obs, reward, done, info = env.step_diff(actions, state)
+
+        # obs, reward, done, info = env.step_with_render(actions, state)
         state = info['state']
     print(time.time() - start_time)

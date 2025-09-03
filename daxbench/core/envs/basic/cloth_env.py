@@ -230,8 +230,45 @@ class ClothEnv:
 
         return step_diff
 
-    def render(self, state: ClothState, visualize=True):
-        return self.renderer.render(self.get_x_grid(state)[0], self.simulator.indices, state.primitive0[0], visualize)
+    def render(self, state: ClothState, visualize=True, idx=0):
+        assert idx < state.x.shape[1]
+        return self.renderer.render(self.get_x_grid(state)[idx], self.simulator.indices, state.primitive0[idx], visualize)
+    
+    def render_all(self, state: ClothState, visualize=False):
+        """
+        render all states in the batch
+        
+        Args:
+            state: ClothState object, contains batch_size states
+            visualize: whether to display the rendering window (False on headless servers)
+            
+        Returns:
+            tuple: (rgb_images, depth_images)
+                - rgb_images: numpy array of shape (batch_size, height, width, 3)
+                - depth_images: numpy array of shape (batch_size, height, width)
+        """
+        import numpy as np
+        
+        x_grids = self.get_x_grid(state)  # shape: (batch_size, N, N, 3)
+        batch_size = x_grids.shape[0]
+        
+        rgb_images = []
+        depth_images = []
+        
+        for i in range(batch_size):
+            rgb, depth = self.renderer.render(
+                x_grids[i], 
+                self.simulator.indices, 
+                state.primitive0[i], 
+                visualize=visualize
+            )
+            rgb_images.append(rgb)
+            depth_images.append(depth)
+        
+        rgb_images = np.array(rgb_images)  # shape: (batch_size, height, width, 3)
+        depth_images = np.array(depth_images)  # shape: (batch_size, height, width)
+        
+        return rgb_images, depth_images
 
     def create_cloth_mask(self, conf):
         raise NotImplementedError

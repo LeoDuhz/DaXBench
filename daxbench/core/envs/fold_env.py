@@ -24,13 +24,13 @@ my_path = os.path.dirname(os.path.abspath(__file__))
 class DefaultConf:
     N = 200
     cell_size = 1.0 / N
-    gravity = 0.5
-    stiffness = 5000
+    gravity = 0.7
+    stiffness = 7000
     damping = 2
     dt = 0.5e-3
     max_v = 2.
     small_num = 1e-8
-    mu = 0.9  # friction
+    mu = 1.5  # friction
     seed = 1
     size = int(N / 5.0)
     mem_saving_level = 2
@@ -50,19 +50,17 @@ class FoldEnv(ClothEnv):
     def __init__(self, batch_size, conf=None, aux_reward=False, seed=1, record_video=False):
         conf = DefaultConf() if conf is None else conf
         max_steps = 5
+        # Always enable dual_arm for rendering
         super().__init__(conf, batch_size, max_steps, aux_reward)
         self.observation_size = 1082
-        self.episode_data = {
-            'states': [],
-        }
-        
+        self.episode_data = {'states': []}
         self.record_video = record_video
-
         self.init_compile()
     
     def init_compile(self):
         obs, state = self.reset(self.simulator.key_global)
-        actions = np.zeros((self.batch_size, 6))
+        # Only compile with 6-dim actions first (most common case)
+        actions = np.zeros((self.batch_size, 12))
         _, _, _, info = self.step_diff(actions, state)
         self.info = info
 
@@ -249,18 +247,18 @@ class FoldEnv(ClothEnv):
 
 
 if __name__ == "__main__":
-    env = FoldEnv(batch_size=8, seed=1, record_video=True)
-    # env.collect_goal()
+    env = FoldEnv(batch_size=1, seed=1, record_video=True)
+    env.collect_goal()
     # env.collect_expert_demo(10)
     print("time start")
     start_time = time.time()
     iter_num = 3
     for i in range(iter_num):
-        # actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
         state = env.get_state()
-        actions = env.get_random_fold_action(state)
-        print(actions.shape)
-        print(actions)
+        actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
+
+        # actions = env.get_random_fold_action(state)
+        # actions = env.get_random_dual_arm_fold_action(state)
         # actions = np.zeros((env.batch_size, 6))
 
         obs, reward, done, info = env.step_fold(actions)

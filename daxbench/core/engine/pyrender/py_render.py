@@ -71,40 +71,55 @@ class BasicPyRenderer:
 
 
 class MeshPyRenderer(BasicPyRenderer):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, top_down_view=True):
+        if top_down_view:
+            camera_position = np.array([0.5, 0.5, 0.8])  
+            camera_target = np.array([0.5, 0.5, 0.0])     
+            cam_pose = self.look_at(camera_position, camera_target, up_vector=np.array([0, -1, 0]))
+        else:
+            cam_pose = None
+        
+        super().__init__(cam_pose=cam_pose)
         self.obj_node = None
         self.obj_node_ = None
         self.gripper0 = None
         self.gripper1 = None
 
-    def render(self, x_grid, indices, ps0, visualize=True):
-
+    def render(self, x_grid, indices, ps0, ps1=None, visualize=True):
         x_grid = x_grid[..., [0, 2, 1]]
         indices_ = indices[:, [0, 2, 1]]
         vertices = x_grid.reshape((-1, 3))
 
-        # front side
         tms = trimesh.Trimesh(vertices=vertices, faces=indices)
         m = pyrender.Mesh.from_trimesh(tms)
         if self.obj_node is not None:
             self.scene.remove_node(self.obj_node)
         self.obj_node = self.scene.add(m)
 
-        # back side
         tms = trimesh.Trimesh(vertices=vertices, faces=indices_)
         m = pyrender.Mesh.from_trimesh(tms)
         if self.obj_node_ is not None:
             self.scene.remove_node(self.obj_node_)
         self.obj_node_ = self.scene.add(m)
 
+        # Always render gripper0 (red)
         if self.gripper0 is None:
             boxf_trimesh = trimesh.creation.icosphere(radius=0.01, subdivisions=4)
-            boxf_face_colors = np.random.uniform(size=boxf_trimesh.faces.shape)
-            boxf_trimesh.visual.face_colors = boxf_face_colors
+            boxf_trimesh.visual.face_colors = [255, 0, 0, 255]
             gripper0 = pyrender.Mesh.from_trimesh(boxf_trimesh, smooth=False)
             self.gripper0 = self.scene.add(gripper0)
         self.gripper0.translation = jnp.array(ps0)[:3][jnp.array((0, 2, 1))]
+
+        # Always render gripper1 (blue)
+        if self.gripper1 is None:
+            boxf_trimesh = trimesh.creation.icosphere(radius=0.01, subdivisions=4)
+            boxf_trimesh.visual.face_colors = [0, 0, 255, 255]
+            gripper1 = pyrender.Mesh.from_trimesh(boxf_trimesh, smooth=False)
+            self.gripper1 = self.scene.add(gripper1)
+        
+        # Use ps1 if provided, otherwise use ps0 (gripper1 stays in same position as gripper0)
+        gripper1_pos = ps1 if ps1 is not None else ps0
+        self.gripper1.translation = jnp.array(gripper1_pos)[:3][jnp.array((0, 2, 1))]
 
         color, depth = self.renderer.render(self.scene)
         color = color[:, ::-1, ::-1]

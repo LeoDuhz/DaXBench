@@ -52,7 +52,7 @@ class ClothEnv:
         self.spec = None
 
         self.idx_i, self.idx_j = jnp.nonzero(self.cloth_mask)
-        self.renderer = MeshPyRenderer()
+        self.renderer = MeshPyRenderer(top_down_view=True)
         self.step_diff = self.build_step_diff()
         self.step_diff = jax.jit(self.step_diff)
         self.reset = self.build_reset()
@@ -172,6 +172,46 @@ class ClothEnv:
 
         return sub_actions
 
+    @staticmethod
+    @partial(vmap, in_axes=(0, 0), out_axes=1)
+    def get_dual_arm_pnp_actions(actions, state: ClothState):
+        arm1_pick, arm1_place = actions[:3], actions[3:6]
+        arm2_pick, arm2_place = actions[6:9], actions[9:12]
+
+        arm1_pick = arm1_pick.at[1].set(0)
+        arm1_place = arm1_place.at[1].set(0)
+        arm2_pick = arm2_pick.at[1].set(0)
+        arm2_place = arm2_place.at[1].set(0)
+
+        # ARM 1 actions
+        act1_down = arm1_pick - state.primitive0[:3]
+        act1_down = jnp.ones(4).at[:3].set(act1_down)
+        act1_down = act1_down[None, ...].repeat(3, axis=0) / 3
+
+        act1_up = jnp.array([0, 0.06, 0, 0])[None, ...].repeat(10, axis=0) / 10
+        
+        act1_move = jnp.zeros(4).at[:3].set((arm1_place - arm1_pick).at[1].set(0))
+        act1_move = act1_move[None, ...].repeat(20, axis=0) / 20
+
+        act1_release = jnp.array([0, 0, 0, 1])[None, ...].repeat(7, axis=0)
+        arm1_actions = jnp.concatenate([act1_down, act1_up, act1_move, act1_release], axis=0)
+
+        # ARM 2 actions
+        act2_down = arm2_pick - state.primitive1[:3]
+        act2_down = jnp.ones(4).at[:3].set(act2_down)
+        act2_down = act2_down[None, ...].repeat(3, axis=0) / 3
+
+        act2_up = jnp.array([0, 0.06, 0, 0])[None, ...].repeat(10, axis=0) / 10
+        
+        act2_move = jnp.zeros(4).at[:3].set((arm2_place - arm2_pick).at[1].set(0))
+        act2_move = act2_move[None, ...].repeat(20, axis=0) / 20
+
+        act2_release = jnp.array([0, 0, 0, 1])[None, ...].repeat(7, axis=0)
+        arm2_actions = jnp.concatenate([act2_down, act2_up, act2_move, act2_release], axis=0)
+
+        sub_actions = jnp.concatenate([arm1_actions, arm2_actions], axis=1)
+        return sub_actions
+
     def get_x_grid(self, state):
         return self.simulator.get_x_grid(state.x)
 
@@ -203,13 +243,41 @@ class ClothEnv:
 
         def step_diff(actions, state: ClothState):
             old_chamfer_distance = calc_chamfer(state.x, self.goal)
-            pickup_place = actions[..., :3]
-            particle_num = state.x.shape[-2]
-            pickup_place = pickup_place[..., None, :].repeat(particle_num, -2)
-            contact_distance = jnp.sqrt(jnp.sum((pickup_place - state.x) ** 2, -1)).min(-1)
-            actions = self.get_pnp_actions(actions, state)
+            
+            if actions.shape[-1] == 12:  # Dual arm actions
+                arm1_pickup = actions[..., :3]
+                arm2_pickup = actions[..., 6:9]
+                particle_num = state.x.shape[-2]
+                
+                arm1_pickup_expanded = arm1_pickup[..., None, :].repeat(particle_num, -2)
+                arm2_pickup_expanded = arm2_pickup[..., None, :].repeat(particle_num, -2)
+                
+                contact_distance1 = jnp.sqrt(jnp.sum((arm1_pickup_expanded - state.x) ** 2, -1)).min(-1)
+                contact_distance2 = jnp.sqrt(jnp.sum((arm2_pickup_expanded - state.x) ** 2, -1)).min(-1)
+                contact_distance = jnp.minimum(contact_distance1, contact_distance2)
+                
+                actions = self.get_dual_arm_pnp_actions(actions, state)
+            else:  # Single arm actions (6-dim) 
+                static_arm_position = jnp.array([-0.8, 0.1, -0.8])  # rest position: top-right corner
+                
+                # [arm1_pick(3), arm1_place(3), arm2_pick(3), arm2_place(3)]
+                expanded_actions = jnp.concatenate([
+                    actions[..., :6],  
+                    static_arm_position[None, :].repeat(actions.shape[0], axis=0),  
+                    static_arm_position[None, :].repeat(actions.shape[0], axis=0)  
+                ], axis=-1)
+                
+                arm1_pickup = expanded_actions[..., :3]
+                particle_num = state.x.shape[-2]
+                arm1_pickup_expanded = arm1_pickup[..., None, :].repeat(particle_num, -2)
+                contact_distance = jnp.sqrt(jnp.sum((arm1_pickup_expanded - state.x) ** 2, -1)).min(-1)
+                
+                # 使用统一的双臂动作处理函数
+                actions = self.get_dual_arm_pnp_actions(expanded_actions, state)
+                
+                
+            
             state, state_list = jax.lax.scan(self.simulator.step_jax, state, actions, length=actions.shape[0])
-
             state = state._replace(cur_step=state.cur_step + 1)
             obs = self.get_obs(state)
 
@@ -217,12 +285,16 @@ class ClothEnv:
                 obs_list = get_obs_list(state_list)
             else:
                 obs_list = obs
-            reward, done, info = 0, state.cur_step >= self.max_steps, {"state": state, "obs_list": obs_list,
-                                                                       "state_list": state_list}
+                
+            reward, done, info = 0, state.cur_step >= self.max_steps, {
+                "state": state, "obs_list": obs_list, "state_list": state_list
+            }
+            
             chamfer_distance = calc_chamfer(state.x, self.goal)
             reward = math.e ** (-chamfer_distance * 10)
             if self.aux_reward:
                 reward += math.e ** (-contact_distance)
+            
             real_reward = old_chamfer_distance - chamfer_distance + 0.1 * contact_distance
             info['real_reward'] = real_reward
             reward *= 0.99 ** state.cur_step
@@ -232,8 +304,15 @@ class ClothEnv:
 
     def render(self, state: ClothState, visualize=True, idx=0):
         assert idx < state.x.shape[1]
-        return self.renderer.render(self.get_x_grid(state)[idx], self.simulator.indices, state.primitive0[idx], visualize)
-    
+        # Always pass both primitives, but ps1 might be same as ps0 for single arm mode
+        return self.renderer.render(
+            self.get_x_grid(state)[idx], 
+            self.simulator.indices, 
+            state.primitive0[idx],
+            ps1=state.primitive1[idx],  # Always pass primitive1
+            visualize=visualize
+        )
+
     def render_all(self, state: ClothState, visualize=False):
         """
         render all states in the batch
@@ -247,7 +326,6 @@ class ClothEnv:
                 - rgb_images: numpy array of shape (batch_size, height, width, 3)
                 - depth_images: numpy array of shape (batch_size, height, width)
         """
-        import numpy as np
         
         x_grids = self.get_x_grid(state)  # shape: (batch_size, N, N, 3)
         batch_size = x_grids.shape[0]
@@ -259,7 +337,8 @@ class ClothEnv:
             rgb, depth = self.renderer.render(
                 x_grids[i], 
                 self.simulator.indices, 
-                state.primitive0[i], 
+                state.primitive0[i],
+                ps1=state.primitive1[i],  # Always pass primitive1
                 visualize=visualize
             )
             rgb_images.append(rgb)
@@ -306,6 +385,7 @@ class ClothEnv:
             if valid_episode:
                 os.makedirs(f"{my_path}/goals/{self.conf.task}", exist_ok=True)
                 np.save(f"{my_path}/goals/{self.conf.task}/goal.npy", state.x[0])
+                print("Goal saved in", f"{my_path}/goals/{self.conf.task}/goal.npy")
                 exit(0)
 
     def collect_expert_demo(self, num_demo=10):
@@ -367,4 +447,23 @@ class ClothEnv:
         ed_point = np.random.randint(0, num_particle, size=(batch_size,))
 
         actions = jnp.concatenate((state.x[batch_idx, st_point], state.x[batch_idx, ed_point]), axis=-1)
+        return actions
+    
+    @staticmethod
+    def get_random_dual_arm_fold_action(state: ClothState):
+        num_particle = state.x.shape[1]
+        batch_size = state.x.shape[0]
+        batch_idx = jnp.arange(batch_size)
+
+        arm1_pick_idx = np.random.randint(0, num_particle, size=(batch_size,))
+        arm1_place_idx = np.random.randint(0, num_particle, size=(batch_size,))
+        arm2_pick_idx = np.random.randint(0, num_particle, size=(batch_size,))
+        arm2_place_idx = np.random.randint(0, num_particle, size=(batch_size,))
+
+        actions = jnp.concatenate((
+            state.x[batch_idx, arm1_pick_idx],
+            state.x[batch_idx, arm1_place_idx],
+            state.x[batch_idx, arm2_pick_idx],
+            state.x[batch_idx, arm2_place_idx]
+        ), axis=-1)
         return actions

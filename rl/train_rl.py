@@ -481,7 +481,7 @@ def main():
                        help='实验名称')
     parser.add_argument('--update_frequency_episodes', type=int, default=10,
                        help='批量环境的更新频率（回合数）')
-    parser.add_argument('--num_sampled_particles', type=int, default=70,
+    parser.add_argument('--num_sampled_particles', type=int, default=30,
                        help='采样后的粒子数量')
     parser.add_argument('--hidden_dim', type=int, default=512,
                        help='隐藏层维度')

@@ -4,11 +4,15 @@ from dataclasses import dataclass
 
 import jax.numpy as jnp
 import numpy as np
+import cv2
+
+# os.environ['PYOPENGL_PLATFORM'] = 'egl'
+# os.environ['DISPLAY'] = ':99'  # 虚拟显示
+# os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 
 from daxbench.core.engine.cloth_simulator import ClothState
 from daxbench.core.envs.basic.cloth_env import ClothEnv
 from daxbench.core.utils.util import get_expert_start_end_cloth
-
 my_path = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -53,7 +57,7 @@ class FoldCloth1Env(ClothEnv):
 
 
 if __name__ == "__main__":
-    env = FoldCloth1Env(batch_size=10000)
+    env = FoldCloth1Env(batch_size=100)
     env.seed(1)
     # env.collect_goal()
     # env.collect_expert_demo(10)
@@ -66,13 +70,17 @@ if __name__ == "__main__":
     # interactive test
     print("time start")
     start_time = time.time()
-    for _ in range(100):
+    for i in range(100):
         # actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
         # actions = env.get_random_fold_action(state)
         actions = np.zeros((env.batch_size, 6))
+        # obs, reward, done, info = env.step_diff(actions, state)
+        obs, reward, done, info = env.step_with_render(actions, state)
+        # state = info['state']
+        # rgb, depth = env.render(state, False)
+        # print(rgb.shape)
+        # print(depth.shape)
+        # cv2.imwrite(f'rgb/rgb_{i}.png', rgb)
+        # cv2.imwrite(f'depth/depth_{i}.png', depth)
 
-        obs, reward, done, info = env.step_diff(actions, state)
-
-        # obs, reward, done, info = env.step_with_render(actions, state)
-        state = info['state']
     print(time.time() - start_time)

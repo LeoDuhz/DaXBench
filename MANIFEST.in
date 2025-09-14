@@ -7,3 +7,4 @@ include README.md
 global-exclude *.py[cod] __pycache__/* *.so *.dylib
 
 recursive-include ./daxbench/core/engine/pyrender/models *.obj
+recursive-include ./daxbench/core/engine/usdrender/scene *.usda

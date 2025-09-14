@@ -1,5 +1,10 @@
 *.png
-
+cloth/
+oracle/
+videos/
+rl_vis/
+rl_results/
+rollout/
 
 
 ##### Python.gitignore #####

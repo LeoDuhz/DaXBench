@@ -113,7 +113,7 @@ class FoldTshirtEnv(ClothEnv):
 
 
 if __name__ == "__main__":
-    env = FoldTshirtEnv(batch_size=1, seed=1)
+    env = FoldTshirtEnv(batch_size=50, seed=1)
     # env.collect_goal()
     # env.collect_expert_demo(10)
     obs, state = env.reset(env.simulator.key_global)
@@ -125,22 +125,35 @@ if __name__ == "__main__":
     vertices = []
     print("time start")
     start_time = time.time()
-    for i in range(3):
-        actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
-        # actions = env.get_random_fold_action(state)
-        # obs, reward, done, info = env.step_diff(actions, state)
-        obs, reward, done, info = env.step_with_render(actions, state)
+    iter_num = 100
+    for i in range(iter_num):
+        # actions = get_expert_start_end_cloth(env.get_x_grid(state), env.cloth_mask)
+        actions = env.get_random_fold_action(state)
+        
+        # actions = np.zeros((env.batch_size, 6))
+        obs, reward, done, info = env.step_diff(actions, state)
+        # obs, reward, done, info = env.step_with_render(actions, state)
+        # print(info.keys())
         state = info['state']
+        print(state.x.shape)
+        # rgb, depth = env.render(state, False)
+        # rgbs, depths = env.render_all(state, False)
+ 
 
-        rgb, depth = env.render(state)
-        cv2.imwrite(f"{env.conf.task}_{i}.jpg", rgb[:, :, ::-1])
+        # print(len(info['state_list']))
+        # print(info['state_list'].keys())
+        # print(info['state_list'].x.shape)
+        # print(rgb.shape)
+        # cv2.imwrite(f"{env.conf.task}_{i}.jpg", rgb[:, :, ::-1])
+        # cv2.imwrite(f'rgb/rgb_{i}.png', rgb)
 
-        for j in range(info['state_list'].x.shape[0]):
-            state_ = jax.tree_util.tree_map(lambda x: x[j], info['state_list'])
-            vertice = env.get_x_grid(state_)[0].reshape((-1, 3))
-            vertices.append(vertice)
+        # for j in range(info['state_list'].x.shape[0]):
+        #     state_ = jax.tree_util.tree_map(lambda x: x[j], info['state_list'])
+        #     vertice = env.get_x_grid(state_)[0].reshape((-1, 3))
+        #     vertices.append(vertice)
 
-    vertices = np.array(vertices)
-    indices = np.array(env.simulator.indices)
-    create_usd_cloth_scene(vertices, indices, "fold_cloth3.usda")
-    print(time.time() - start_time)
+    # vertices = np.array(vertices)
+    # indices = np.array(env.simulator.indices)
+    # create_usd_cloth_scene(vertices, indices, "fold_cloth3.usda")
+    print('All time: ', time.time() - start_time)
+    print('Average time: ', (time.time() - start_time) / iter_num)

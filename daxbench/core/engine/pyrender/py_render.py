@@ -14,7 +14,7 @@ my_path = os.path.dirname(os.path.abspath(__file__))
 
 
 class BasicPyRenderer:
-    def __init__(self, cam_pose=None, screen_size=(640, 480)):
+    def __init__(self, cam_pose=None, screen_size=(400, 400)):
         # Scene creation
         scene = pyrender.Scene(ambient_light=np.array([0.05, 0.05, 0.05, 1.0]))
 
@@ -25,8 +25,8 @@ class BasicPyRenderer:
         self.wood_node = scene.add(wood_mesh)
         self.wood_node.scale *= ground_size / (wood_mesh.bounds[1] - wood_mesh.bounds[0])
         self.wood_node.scale[2] = 1.0
-        self.wood_node.translation = [0.48 * ground_size[0], 0.46 * ground_size[1], -0.02]
-
+        self.wood_node.translation = [0.5 * ground_size[0], 0.5 * ground_size[1], -0.02]
+        
         # Light creation
         direc_l = pyrender.DirectionalLight(color=np.ones(3), intensity=1.0)
         spot_l = pyrender.SpotLight(color=np.ones(3), intensity=10.0,
@@ -34,7 +34,8 @@ class BasicPyRenderer:
         point_l = pyrender.PointLight(color=np.ones(3), intensity=10.0)
 
         # Camera creation
-        cam = pyrender.PerspectiveCamera(yfov=(np.pi / 3.0))
+        # cam = pyrender.PerspectiveCamera(yfov=(np.pi / 3.0))
+        cam = pyrender.OrthographicCamera(xmag=0.5, ymag=0.5)  # 视野范围 [0, 1]
 
         light_pose = self.look_at(np.array([0.9, 0.5, 1.0]), np.array([0.6, 0.5, 0]))
         if cam_pose is None: cam_pose = light_pose

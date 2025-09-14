@@ -1,4 +1,4 @@
-"""Script for pax push rope environment calibration.
+    """Script for pax push rope environment calibration.
 
 Before running this script:
 - The Kinova ROS driver must be up.

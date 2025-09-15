@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from typing import List, Dict, Any, Tuple
 import gym
 from gym import spaces
+import time
 from datetime import datetime
 from daxbench.core.envs.fold_env import FoldEnv, DefaultConf, spatial_sampling
 from daxbench.core.envs.basic.cloth_env import ClothEnv
@@ -29,7 +30,10 @@ class RLClothFoldEnv(gym.Env):
                  reward_type="final_goal",  # "final_goal", "subgoal", or "combined"
                  action_type="continuous",  # "continuous" or "discrete"
                  num_sampled_particles=64,  # 采样后的粒子数量
-                 sampling_method="kmeans"):  # 空间采样方法 ("kmeans", "grid", "farthest_point")
+                 sampling_method="kmeans",  # 空间采样方法 ("kmeans", "grid", "farthest_point")
+                 rl_type="ppo",  # RL算法类型，用于路径命名
+                 mode="train",  # 模式：train或eval
+                 timestamp=None):  # 统一时间戳
         """
         初始化RL环境
         
@@ -41,6 +45,9 @@ class RLClothFoldEnv(gym.Env):
             action_type: 动作类型 ("continuous" 或 "discrete")
             num_sampled_particles: 采样后的目标粒子数量
             sampling_method: 空间采样方法 ("kmeans", "grid", "farthest_point")
+            rl_type: RL算法类型，用于路径命名
+            mode: 模式：train或eval
+            timestamp: 统一时间戳，用于路径和实验命名的一致性
         """
         
         if conf is None:
@@ -59,8 +66,14 @@ class RLClothFoldEnv(gym.Env):
         self.action_type = action_type
         self.num_sampled_particles = num_sampled_particles  # 目标采样粒子数量
         self.sampling_method = sampling_method  # 空间采样方法
+        self.rl_type = rl_type
+        self.mode = mode
         self.episode_count = 0
-        self.rollout_path = f'rollout/{self.task}/{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.timestamp = timestamp
+        self.rollout_path = f'rollout/{self.task}/{self.rl_type}_{self.timestamp}/{self.mode}'
 
         # Cache for sampled particles to avoid redundant sampling
         self.cached_sampled_particles = None
@@ -296,6 +309,7 @@ class RLClothFoldEnv(gym.Env):
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
         """执行批量动作"""
         # 转换动作格式
+        start_time = time.time()
         env_action = self._convert_action(action)
         
         # 执行动作 - FoldEnv现在内部处理所有奖励计算
@@ -313,7 +327,8 @@ class RLClothFoldEnv(gym.Env):
         if isinstance(done, bool):
             # 如果是标量，转换为数组
             done = np.full(self.batch_size, done)
-            
+        time_cost = time.time() - start_time
+        print(f"Time cost: {time_cost} seconds")
         return observation, np.array(rewards), np.array(done), info
     
     def reset(self) -> np.ndarray:
@@ -363,7 +378,10 @@ class SingleRLClothFoldEnv(gym.Env):
                  reward_type="final_goal",
                  action_type="continuous",
                  num_sampled_particles=64,
-                 sampling_method="kmeans"):
+                 sampling_method="kmeans",
+                 rl_type="ppo",
+                 mode="train",
+                 timestamp=None):
         """
         初始化单环境包装器
         """
@@ -384,7 +402,10 @@ class SingleRLClothFoldEnv(gym.Env):
             reward_type=reward_type,
             action_type=action_type,
             num_sampled_particles=num_sampled_particles,
-            sampling_method=sampling_method
+            sampling_method=sampling_method,
+            rl_type=rl_type,
+            mode=mode,
+            timestamp=timestamp
         )
         
         # 设置单环境的动作和观察空间

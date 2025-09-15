@@ -631,17 +631,17 @@ class ClothEnv:
         for i in range(batch_size):
             # 使用第i个batch对应的mask修正第一个pick点
             arm1_pick_corrected = ClothEnv.correct_single_pick_point(
-                arm1_pick[i], states.x[i], cloth_masks[i], grid_size
+                arm1_pick[i], states.x[i], None, grid_size
             )
             arm1_place_corrected = ClothEnv.correct_single_pick_point(
-                arm1_place[i], states.x[i], cloth_masks[i], grid_size
+                arm1_place[i], states.x[i], None, grid_size
             )
             # 使用第i个batch对应的mask修正第二个pick点
             arm2_pick_corrected = ClothEnv.correct_single_pick_point(
-                arm2_pick[i], states.x[i], cloth_masks[i], grid_size
+                arm2_pick[i], states.x[i], None, grid_size
             )
             arm2_place_corrected = ClothEnv.correct_single_pick_point(
-                arm2_place[i], states.x[i], cloth_masks[i], grid_size
+                arm2_place[i], states.x[i], None, grid_size
             )
             # 重新组合action
             # corrected_action = jnp.concatenate([
@@ -687,6 +687,8 @@ class ClothEnv:
             print(state_x[nearest_idx])
             print(f'Min distance: {min_distance}, pick point is too far from cloth, use original pick point')
             return pick_point
+        # elif min_distance > 0.001:
+        #     print(pick_point, state_x[nearest_idx])
         nearest_point = state_x[nearest_idx]
         return nearest_point
 

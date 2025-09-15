@@ -24,19 +24,25 @@ from icecream import ic as print
 my_path = os.path.dirname(os.path.abspath(__file__))
 
 
-def spatial_sampling(particles: np.ndarray, target_num: int, method: str = "kmeans") -> np.ndarray:
+def spatial_sampling(particles: np.ndarray, target_num: int, method: str = "kmeans", **kwargs) -> np.ndarray:
     """
     基于空间分布的粒子采样算法
     
     Args:
         particles: 输入粒子坐标，形状为 (num_particles, 3)
         target_num: 目标采样数量
-        method: 采样方法 ("kmeans", "grid", "farthest_point")
+        method: 采样方法 ("kmeans", "grid", "farthest_point", "farthest_point_jax", "farthest_point_approx", "farthest_point_hybrid", "farthest_point_fast")
+        **kwargs: 额外参数
+            - subsample_ratio: 用于farthest_point_approx方法的预采样比例 (default: 0.5)
     
     Returns:
         采样后的粒子坐标，形状为 (target_num, 3)
     """
     start_time = time.time()
+    # 如果数据量很大，打印调试信息
+    if len(particles) > 5000 or target_num > 100:
+        print(f"Large sampling: {len(particles)} particles -> {target_num}, method: {method}")
+    
     if len(particles) <= target_num:
         # 如果粒子数不足，用最后一个粒子填充
         if len(particles) < target_num:
@@ -45,18 +51,39 @@ def spatial_sampling(particles: np.ndarray, target_num: int, method: str = "kmea
             padding = np.repeat(last_particle, padding_needed, axis=0)
             return np.concatenate([particles, padding], axis=0)
         return particles
+    particles = np.array(particles)
     
     if method == "kmeans":
-        # print(f"K-means sampling time: {time.time() - start_time}")
         return _kmeans_sampling(particles, target_num)
     elif method == "grid":
-        print(f"Grid sampling time: {time.time() - start_time}")
         return _grid_sampling(particles, target_num)
     elif method == "farthest_point":
-        print(f"Farthest point sampling time: {time.time() - start_time}")
         return _farthest_point_sampling(particles, target_num)
+    elif method == "farthest_point_jax":
+        # JAX版本，支持GPU加速 - 优化的调用方式
+        # 减少不必要的类型转换，直接在JAX中处理
+        particles_jax = jnp.array(particles)
+        result = _farthest_point_sampling_jax(particles_jax, target_num)
+        return np.asarray(result)  # 使用asarray而非array，更高效
+    elif method == "farthest_point_approx":
+        # 近似版本，速度更快
+        subsample_ratio = kwargs.get('subsample_ratio', 0.5)
+        return _farthest_point_sampling_approximate(particles, target_num, subsample_ratio)
+    elif method == "farthest_point_hybrid":
+        # 混合策略：小数据用JAX，大数据用优化的近似方法
+        if len(particles) <= 1000 and target_num <= 50:
+            particles_jax = jnp.array(particles)
+            result = _farthest_point_sampling_jax(particles_jax, target_num)
+            return np.asarray(result)
+        else:
+            # 对于大数据，使用改进的近似方法
+            return _farthest_point_sampling_approximate(particles, target_num, 0.3)
+    elif method == "farthest_point_fast":
+        # 超快速版本：专为训练时高频调用优化
+        return _farthest_point_sampling_fast(particles, target_num)
     else:
-        raise ValueError(f"Unsupported sampling method: {method}")
+        raise ValueError(f"Unsupported sampling method: {method}. "
+                        f"Supported methods: 'kmeans', 'grid', 'farthest_point', 'farthest_point_jax', 'farthest_point_approx', 'farthest_point_hybrid', 'farthest_point_fast'")
 
 def _kmeans_sampling(particles: np.ndarray, target_num: int) -> np.ndarray:
     """
@@ -144,6 +171,7 @@ def _grid_sampling(particles: np.ndarray, target_num: int) -> np.ndarray:
         ])
         
         # 找到最接近网格中心的粒子
+        particle_indices = np.array(particle_indices)
         grid_particles = particles[particle_indices]
         distances = np.linalg.norm(grid_particles - grid_center, axis=1)
         closest_idx = np.argmin(distances)
@@ -186,44 +214,150 @@ def _grid_sampling(particles: np.ndarray, target_num: int) -> np.ndarray:
 
 def _farthest_point_sampling(particles: np.ndarray, target_num: int) -> np.ndarray:
     """
-    最远点采样算法
-    逐步选择与已选点距离最远的点
+    最远点采样算法 - 优化版本
+    逐步选择与已选点距离最远的点，使用向量化操作加速
     """
     if len(particles) <= target_num:
         return particles
     
+    n_points = len(particles)
     sampled_indices = []
     
-    # 选择第一个点（随机选择或选择中心点）
+    # 选择第一个点（选择最接近中心的点）
     center = np.mean(particles, axis=0)
     distances_to_center = np.linalg.norm(particles - center, axis=1)
     first_idx = np.argmin(distances_to_center)
     sampled_indices.append(first_idx)
     
+    # 初始化距离数组：每个点到已选点的最小距离
+    min_distances = np.full(n_points, np.inf)
+    
     # 逐步选择最远点
     for _ in range(target_num - 1):
-        max_min_distance = -1
-        farthest_idx = -1
+        last_selected = sampled_indices[-1]
         
-        for i in range(len(particles)):
-            if i in sampled_indices:
-                continue
-            
-            # 计算到已选点的最小距离
-            min_distance = float('inf')
-            for sampled_idx in sampled_indices:
-                distance = float(np.linalg.norm(particles[i] - particles[sampled_idx]))
-                min_distance = min(min_distance, distance)
-            
-            # 更新最远点
-            if min_distance > max_min_distance:
-                max_min_distance = min_distance
-                farthest_idx = i
+        # 向量化计算：更新所有点到最新选择点的距离
+        distances_to_last = np.linalg.norm(particles - particles[last_selected], axis=1)
+        min_distances = np.minimum(min_distances, distances_to_last)
         
-        if farthest_idx != -1:
-            sampled_indices.append(farthest_idx)
+        # 将已选择的点的距离设为0，避免重复选择
+        min_distances[sampled_indices] = 0
+        
+        # 选择距离最大的点
+        farthest_idx = np.argmax(min_distances)
+        sampled_indices.append(farthest_idx)
     
     return particles[sampled_indices]
+
+def _farthest_point_sampling_jax(particles, target_num: int):
+    """
+    JAX版本的最远点采样算法 - 高性能实现
+    避免重复JIT编译和大内存分配，解决卡顿问题
+    """
+    # 在外部处理边界条件
+    if particles.shape[0] <= target_num:
+        return particles
+    
+    n_points = particles.shape[0]
+    
+    # 选择第一个点（最接近中心的点）
+    center = jnp.mean(particles, axis=0)
+    distances_to_center = jnp.linalg.norm(particles - center, axis=1)
+    first_idx = jnp.argmin(distances_to_center)
+    
+    # 使用简化的实现，避免复杂的JIT操作
+    sampled_indices = [int(first_idx)]
+    min_distances = jnp.full(n_points, jnp.inf)
+    
+    # 简化的循环实现，避免重复JIT编译
+    for _ in range(target_num - 1):
+        last_selected = sampled_indices[-1]
+        
+        # JAX向量化计算距离
+        distances_to_last = jnp.linalg.norm(particles - particles[last_selected], axis=1)
+        min_distances = jnp.minimum(min_distances, distances_to_last)
+        
+        # 高效地将已选择的点的距离设为0
+        # 使用简单的at操作，避免复杂的广播
+        for idx in sampled_indices:
+            min_distances = min_distances.at[idx].set(0.0)
+        
+        # 选择距离最大的点
+        farthest_idx = int(jnp.argmax(min_distances))
+        sampled_indices.append(farthest_idx)
+    
+    return particles[jnp.array(sampled_indices)]
+
+def _farthest_point_sampling_fast(particles: np.ndarray, target_num: int) -> np.ndarray:
+    """
+    超快速最远点采样算法 - 专为训练时高频调用优化
+    使用激进的近似策略，优先速度而非精度
+    """
+    if len(particles) <= target_num:
+        # 如果粒子数不足，用最后一个粒子填充
+        if len(particles) < target_num:
+            padding_needed = target_num - len(particles)
+            last_particle = particles[-1:, :]
+            padding = np.repeat(last_particle, padding_needed, axis=0)
+            return np.concatenate([particles, padding], axis=0)
+        return particles
+    
+    # 对于大数据集，使用更激进的预采样
+    if len(particles) > target_num * 5:
+        # 先随机预采样到合理大小
+        subsample_size = min(target_num * 3, len(particles) // 2)
+        subsample_indices = np.random.choice(len(particles), subsample_size, replace=False)
+        particles = particles[subsample_indices]
+    
+    # 使用简化的最远点采样
+    n_points = len(particles)
+    
+    # 选择第一个点（随机选择以提高速度）
+    first_idx = np.random.randint(0, n_points)
+    sampled_indices = [first_idx]
+    
+    # 只计算部分点的距离，进一步提速
+    for _ in range(target_num - 1):
+        last_selected = sampled_indices[-1]
+        
+        # 计算距离
+        distances = np.linalg.norm(particles - particles[last_selected], axis=1)
+        
+        # 将已选择的点的距离设为0
+        for idx in sampled_indices:
+            distances[idx] = 0.0
+        
+        # 选择距离最大的点
+        farthest_idx = int(np.argmax(distances))
+        sampled_indices.append(farthest_idx)
+    
+    return particles[sampled_indices]
+
+def _farthest_point_sampling_approximate(particles: np.ndarray, target_num: int, subsample_ratio: float = 0.5) -> np.ndarray:
+    """
+    近似最远点采样算法 - 通过预采样减少计算量
+    
+    Args:
+        particles: 输入粒子坐标
+        target_num: 目标采样数量  
+        subsample_ratio: 预采样比例，在0-1之间，越小速度越快但精度略低
+    """
+    if len(particles) <= target_num:
+        return particles
+    
+    # 如果粒子数量很大，先进行预采样
+    if len(particles) > target_num * 10 and subsample_ratio < 1.0:
+        # 随机预采样，减少候选点数量
+        subsample_size = max(target_num * 3, int(len(particles) * subsample_ratio))
+        subsample_indices = np.random.choice(len(particles), subsample_size, replace=False)
+        particles_subset = particles[subsample_indices]
+        
+        # 在子集上进行最远点采样
+        sampled_subset = _farthest_point_sampling(particles_subset, target_num)
+        return sampled_subset
+    else:
+        # 直接使用优化的最远点采样
+        return _farthest_point_sampling(particles, target_num)
 
 
 @dataclass
@@ -246,10 +380,12 @@ class DefaultConf:
     batch_size = 10
     cloth_type = 'tshirt'
     task = "S_Corner_All_Middle"
-    id_range = list(range(0, 10))
+    id_range = list(range(0, 50))
     goal_path = f"{my_path}/goals/{task}/goal.npy"
     use_substep_obs = True
     record_video = False
+    sampling_method = 'farthest_point'
+    num_sampled_particles = 15
     # N = 200
     # cell_size = 1.0 / N
     # gravity = 0.7
@@ -287,6 +423,8 @@ class FoldEnv(ClothEnv):
         self.cloth_type = conf.cloth_type
         self.reward_type = reward_type  # "final_goal", "subgoal", "combined", "final_goal_delta", "subgoal_delta"
         self.subgoals_dir = os.path.join('oracle', conf.task)
+        self.sampling_method = conf.sampling_method
+        self.num_sampled_particles = conf.num_sampled_particles
         
         # Always enable dual_arm for rendering
         init_start_time = time.time()
@@ -359,12 +497,21 @@ class FoldEnv(ClothEnv):
         # 处理关键点...
         if self.cloth_type == 'tshirt':
             for i in range(self.batch_size):
+                if self.gt_keypoints_list[i] is None:
+                    self.gt_keypoints_list[i] = []
+                    continue
                 self.gt_keypoints_list[i] = [self.gt_keypoints_list[i]['bottom_left'], self.gt_keypoints_list[i]['left_armpit'], self.gt_keypoints_list[i]['left_sleeve_bottom'], self.gt_keypoints_list[i]['left_sleeve_top'], self.gt_keypoints_list[i]['left_shoulder_top'], self.gt_keypoints_list[i]['left_collar'], self.gt_keypoints_list[i]['spine_top'], self.gt_keypoints_list[i]['right_collar'], self.gt_keypoints_list[i]['right_shoulder_top'], self.gt_keypoints_list[i]['right_sleeve_top'], self.gt_keypoints_list[i]['right_sleeve_bottom'], self.gt_keypoints_list[i]['right_armpit'], self.gt_keypoints_list[i]['bottom_right']]
         elif self.cloth_type == 'pant':
             for i in range(self.batch_size):
+                if self.gt_keypoints_list[i] is None:
+                    self.gt_keypoints_list[i] = []
+                    continue
                 self.gt_keypoints_list[i] = [self.gt_keypoints_list[i]['left_leg_right'], self.gt_keypoints_list[i]['left_leg_left'], self.gt_keypoints_list[i]['top_left'], self.gt_keypoints_list[i]['top_right'], self.gt_keypoints_list[i]['right_leg_right'], self.gt_keypoints_list[i]['right_leg_left'], self.gt_keypoints_list[i]['crotch']]
         elif self.cloth_type == 'rectangle' or self.cloth_type == 'square':
             for i in range(self.batch_size):
+                if self.gt_keypoints_list[i] is None:
+                    self.gt_keypoints_list[i] = []
+                    continue
                 self.gt_keypoints_list[i] = [self.gt_keypoints_list[i]['top_left'], self.gt_keypoints_list[i]['top_right'], self.gt_keypoints_list[i]['bottom_right'], self.gt_keypoints_list[i]['bottom_left']]
         else:
             raise NotImplementedError
@@ -453,6 +600,8 @@ class FoldEnv(ClothEnv):
             # 检查是否达到子目标（距离阈值）
             if distance < subgoal_threshold:
                 print(f"subgoals_reached[i]: {subgoals_reached[i]}", f"distance: {distance}")
+            # else:
+            #     print(f"distance: {distance}")
             subgoals_reached[i] = distance < subgoal_threshold  # 可调整阈值
         return rewards, subgoals_reached
     
@@ -606,8 +755,11 @@ class FoldEnv(ClothEnv):
         cand = [f"{mask_id}.png"]
 
         gt_keypoints_path = os.path.join(base_dir.replace('mask', 'gt_keypoints'), f"{mask_id}.pkl")
-        with open(gt_keypoints_path, 'rb') as f:
-            gt_keypoints = pickle.load(f)
+        if not os.path.exists(gt_keypoints_path):
+            gt_keypoints = None
+        else:
+            with open(gt_keypoints_path, 'rb') as f:
+                gt_keypoints = pickle.load(f)
 
         for name in cand:
             p = os.path.join(base_dir, name)
@@ -663,13 +815,21 @@ class FoldEnv(ClothEnv):
     def step_fold(self, actions, visualize=False, visualize_path=None):
         self.step_count += 1
         state_before = self.info['state']
-        rgbs_before, depths_before, mask_images = self.render_all(state_before, need_mask=True, visualize=False)
-        
-        # 修复：生成cloth_masks
-        # cloth_masks = ClothEnv.generate_cloth_mask_from_state(state_before, grid_size=self.conf.N)
-        
+        # rgbs_before, depths_before, mask_images = self.render_all(state_before, need_mask=True, visualize=False)
+        # actions_test = actions.copy()
+        # for i in range(actions_test.shape[0]):
+        #     actions_test[i, 0] = self.gt_keypoints_list[i][1][0] /400
+        #     actions_test[i, 2] = self.gt_keypoints_list[i][1][1] /400
+        #     actions_test[i, 3] = (self.gt_keypoints_list[i][1][0] + self.gt_keypoints_list[i][3][0]) / 2 / 400
+        #     actions_test[i, 5] = (self.gt_keypoints_list[i][1][1] + self.gt_keypoints_list[i][3][1]) / 2 / 400
+        #     actions_test[i, 6] = self.gt_keypoints_list[i][1][0] / 400
+        #     actions_test[i, 8] = self.gt_keypoints_list[i][1][1] / 400
+        #     actions_test[i, 9] = (self.gt_keypoints_list[i][1][0] + self.gt_keypoints_list[i][3][0]) / 2 / 400
+        #     actions_test[i, 11] = (self.gt_keypoints_list[i][1][1] + self.gt_keypoints_list[i][3][1]) / 2 / 400
+        # actions = actions_test
+ 
         corrected_actions = ClothEnv.check_and_correct_dual_arm_pick_points(
-            actions, state_before, mask_images, grid_size=self.conf.N
+            actions, state_before, None, grid_size=self.conf.N
         )
 
         actions = corrected_actions
@@ -696,15 +856,16 @@ class FoldEnv(ClothEnv):
         if visualize and visualize_path is not None:
             start = time.time()
             for i in range(0, self.batch_size):
-                if not (i % 40 == 0 or (self.subgoals_reached is not None and self.subgoals_reached[i])):
+                if not ((self.subgoals_reached is not None and self.subgoals_reached[i])):
                     continue
+                rgb_before, _, = self.render(state_before, idx=i, visualize=False)
                 save_path = os.path.join(visualize_path, f"{i}_{self.chosen_ids[i]}",f'{self.step_count}')
                 if not os.path.exists(save_path):
                     os.makedirs(save_path)
                 
-                rgb_pnp = rgbs_before[i].copy()
-                rgb_pc = rgbs_before[i].copy()
-                x_sampled = spatial_sampling(state_before.x[i], 30, method="kmeans")
+                rgb_pnp = rgb_before.copy()
+                rgb_pc = rgb_before.copy()
+                x_sampled = spatial_sampling(state_before.x[i], self.num_sampled_particles, method=self.sampling_method)
                 for j in range(x_sampled.shape[0]):
                     cv2.circle(rgb_pc, (int(x_sampled[j, 0]*rgb_pnp.shape[1]), int(x_sampled[j, 2]*rgb_pnp.shape[0])), 5, (255, 0, 255), -1)
                     cv2.circle(rgb_pc, (int(x_sampled[j, 0]*rgb_pc.shape[1]), int(x_sampled[j, 2]*rgb_pc.shape[0])), 5, (255, 0, 255), -1)
@@ -720,30 +881,30 @@ class FoldEnv(ClothEnv):
                 with open(os.path.join(save_path, f'info.txt'), 'w') as f:
                     f.write('pick1: (' + f'{actions[i, 0]*rgb_pnp.shape[1]}' + ', ' + f'{actions[i, 2]*rgb_pnp.shape[0]}' + ')' + '\n' + 'place1: (' + f'{actions[i, 3]*rgb_pnp.shape[1]}' + ', ' + f'{actions[i, 5]*rgb_pnp.shape[0]}' + ')' + '\n' + 'pick2: (' + f'{actions[i, 6]*rgb_pnp.shape[1]}' + ', ' + f'{actions[i, 8]*rgb_pnp.shape[0]}' + ')' + '\n' + 'place2: (' + f'{actions[i, 9]*rgb_pnp.shape[1]}' + ', ' + f'{actions[i, 11]*rgb_pnp.shape[0]}' + ')' + '\n' + 'reward_type: ' + f'{self.reward_type}' + '\n' + 'reward: ' + f'{reward[i]}' + '\n' + 'subgoal_idx: ' + f'{self.current_subgoal_idx[i]}' + '\n' + 'subgoal_step: ' + f'{self.current_subgoal_step[i]}' + '\n' + 'total_subgoals: ' + f'{len(self.subgoals[i])}' + '\n' + 'max_subgoal_steps: ' + f'{self.max_subgoal_steps}' + '\n' + 'distance: ' + f'{self.distances[i]}' + '\n' + 'subgoal_reached: ' + f'{self.subgoals_reached[i]}')
 
-                rgb_pc_goal = rgbs_before[i].copy()
+                rgb_pc_goal = rgb_before.copy()
                
                 if self.current_subgoal_idx[i] < len(self.subgoals[i]):
                     cur_subgoal = self.subgoals[i][self.current_subgoal_idx[i]]
-                    cur_subgoal_sampled = spatial_sampling(cur_subgoal, 30, method="kmeans")
+                    cur_subgoal_sampled = spatial_sampling(cur_subgoal, self.num_sampled_particles, method=self.sampling_method)
                     for j in range(cur_subgoal_sampled.shape[0]):
                         cv2.circle(rgb_pc_goal, (int(cur_subgoal_sampled[j, 0]*rgb_pc_goal.shape[1]), int(cur_subgoal_sampled[j, 2]*rgb_pc_goal.shape[0])), 5, (255, 0, 255), -1)
 
                     cv2.imwrite(os.path.join(save_path, f'rgb_pc_goal.png'), rgb_pc_goal)
 
-                rgbs_after, _, _ = self.render_all(self.info['state'], need_mask=True, visualize=False)
-                rgb_pc_goal_obs = rgbs_after[i].copy()
+                rgb_after, _= self.render(self.info['state'], idx=i, visualize=False)
+                rgb_pc_goal_obs = rgb_after.copy()
 
                 if self.current_subgoal_idx[i] < len(self.subgoals[i]):
                     cur_subgoal = self.subgoals[i][self.current_subgoal_idx[i]]
-                    cur_subgoal_sampled = spatial_sampling(cur_subgoal, 30, method="kmeans")
+                    cur_subgoal_sampled = spatial_sampling(cur_subgoal, self.num_sampled_particles, method=self.sampling_method)
                     for j in range(cur_subgoal_sampled.shape[0]):
                         cv2.circle(rgb_pc_goal_obs, (int(cur_subgoal_sampled[j, 0]*rgb_pc_goal_obs.shape[1]), int(cur_subgoal_sampled[j, 2]*rgb_pc_goal_obs.shape[0])), 5, (255, 0, 255), -1)
-                    cur_obs_sampled = spatial_sampling(self.info['state'].x[i], 30, method="kmeans")
+                    cur_obs_sampled = spatial_sampling(self.info['state'].x[i], self.num_sampled_particles, method=self.sampling_method)
                     for j in range(cur_obs_sampled.shape[0]):
                         cv2.circle(rgb_pc_goal_obs, (int(cur_obs_sampled[j, 0]*rgb_pc_goal_obs.shape[1]), int(cur_obs_sampled[j, 2]*rgb_pc_goal_obs.shape[0])), 5, (120, 0, 120), -1)
                     cv2.imwrite(os.path.join(save_path, f'rgb_pc_goal_obs.png'), rgb_pc_goal_obs)
 
-                cv2.imwrite(os.path.join(save_path, f'rgbs_after.png'), rgbs_after[i])
+                cv2.imwrite(os.path.join(save_path, f'rgb_after.png'), rgb_after)
             end = time.time()
             # print(f"Time taken for one round of visualization: {end - start} seconds")
 
@@ -768,7 +929,9 @@ class FoldEnv(ClothEnv):
             
             subgoal_rewards, subgoals_reached = self._calculate_subgoal_reward(current_state)
             episode_success, subgoal_advanced, subgoal_timeout = self._update_subgoal_states(subgoals_reached)
+
             self.subgoals_reached = subgoals_reached
+            self.episode_success = episode_success
             # 计算最终奖励
             rewards = subgoal_rewards.copy()
             
@@ -776,10 +939,10 @@ class FoldEnv(ClothEnv):
             rewards += subgoals_reached * 10.0
             
             # 完成所有子目标的大奖励
-            rewards += episode_success * 100.0
+            # rewards += episode_success * 100.0
             
             # 超时惩罚
-            rewards -= subgoal_timeout * 1.0
+            # rewards -= subgoal_timeout * 1.0
             
             return rewards
             
@@ -791,6 +954,7 @@ class FoldEnv(ClothEnv):
                 subgoal_rewards, subgoals_reached = self._calculate_subgoal_reward(current_state)
                 episode_success, subgoal_advanced, subgoal_timeout = self._update_subgoal_states(subgoals_reached)
                 self.subgoals_reached = subgoals_reached
+                self.episode_success = episode_success
                 # 组合奖励：0.3 * final_goal + 0.7 * subgoal
                 combined_rewards = 0.3 * final_reward + 0.7 * subgoal_rewards
                 
@@ -819,6 +983,7 @@ class FoldEnv(ClothEnv):
             delta_rewards, subgoals_reached = self._calculate_subgoal_delta_reward(current_state)
             episode_success, subgoal_advanced, subgoal_timeout = self._update_subgoal_states(subgoals_reached)
             self.subgoals_reached = subgoals_reached
+            self.episode_success = episode_success
             # 计算最终奖励
             rewards = delta_rewards.copy()
             
@@ -851,6 +1016,8 @@ class FoldEnv(ClothEnv):
             'subgoal_idx': self.current_subgoal_idx.copy(),
             'subgoal_step': self.current_subgoal_step.copy(),
             'total_subgoals': total_subgoals_per_env,
+            'subgoal_reached': self.subgoals_reached.copy(),
+            'episode_success': self.episode_success.copy(),
             'max_subgoal_steps': self.max_subgoal_steps,
             'chosen_ids': self.chosen_ids.copy()
         }
@@ -1087,8 +1254,6 @@ if __name__ == "__main__":
     start_time = time.time()
     iter_num = 1
     
-
-    actions_list.append(action1)
     for i in range(iter_num):
         state = env.get_state()
         

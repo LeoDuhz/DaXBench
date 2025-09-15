@@ -20,19 +20,34 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default='S_Corner_All_Middle',
                        help='任务名称')
+    parser.add_argument('--only_render_first_image', action='store_true', default=False,
+                       help='只渲染第一张图片')
     args = parser.parse_args()
     oracle_base_dir = 'oracle'
     task = args.task
+    only_render_first_image = args.only_render_first_image
     task_dir = os.path.join(oracle_base_dir, task)
     task_func = globals()[task]()
     conf = DefaultConf()
+    if task.startswith('T') or task.startswith('P'):
+        conf.N = 150
     
     conf.batch_size = 20
     conf.id_range = list(range(0, 20))
+    if only_render_first_image:
+        conf.id_range = list(range(0, 100))
+        conf.batch_size = len(conf.id_range)
 
     # conf.id_range = list(range(0, 50))
     # conf.id_range = list(range(50, 100))
-    conf.cloth_type = 'square'
+    if task.startswith('S'):
+        conf.cloth_type = 'square'
+    elif task.startswith('T'):
+        conf.cloth_type = 'tshirt'
+    elif task.startswith('P'):
+        conf.cloth_type = 'pant'
+    elif task.startswith('R'):
+        conf.cloth_type = 'rectangle'
     conf.task = task
     conf.record_video = True
     env = FoldEnv(conf=conf, seed=1)    
@@ -41,6 +56,14 @@ if __name__ == "__main__":
     for i in range(iter_num):
         state_before = env.get_state()
         rgbs_before, _, _ = env.render_all(state_before, need_mask=True, visualize=False)
+
+        if only_render_first_image:
+            for batch_idx in range(conf.batch_size):
+                if not os.path.exists(os.path.join('first_image', f'{conf.cloth_type}')):
+                    os.makedirs(os.path.join('first_image', f'{conf.cloth_type}'))
+                cv2.imwrite(os.path.join('first_image', f'{conf.cloth_type}', f"rgbs_{env.chosen_ids[batch_idx]}.png"), rgbs_before[batch_idx])
+            exit()
+        
         for batch_idx in range(conf.batch_size):
             if not os.path.exists(os.path.join(task_dir, f"{batch_idx}", f"{i}")):
                 os.makedirs(os.path.join(task_dir, f"{batch_idx}", f"{i}"))

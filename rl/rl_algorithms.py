@@ -289,8 +289,7 @@ class PPOAgent:
         old_actions = torch.FloatTensor(np.array(self.buffer['actions'])).to(self.device)
         old_log_probs = torch.FloatTensor(self.buffer['log_probs']).to(self.device)
         old_values = torch.FloatTensor(self.buffer['values']).to(self.device)
-        print(old_values.shape)
-        print(rewards.shape)
+   
         # 计算优势
         advantages = rewards - old_values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -500,6 +499,7 @@ class SACAgent:
                 raise ValueError("num_particles must be specified for discrete action space")
             pick_idx = np.random.randint(0, self.num_particles)
             place_idx = np.random.randint(0, self.num_particles)
+            # print(pick_idx, place_idx)
             return np.array([pick_idx, place_idx], dtype=np.float32)
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")

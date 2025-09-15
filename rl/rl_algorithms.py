@@ -414,6 +414,8 @@ class SACAgent:
                  buffer_size: int = 100000,
                  batch_size: int = 256,
                  hidden_dim: int = 256,
+                 # 新增参数：随机采样阶段
+                 random_exploration_steps: int = 10000,  # 随机探索步数
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         
         self.device = device
@@ -423,6 +425,11 @@ class SACAgent:
         self.batch_size = batch_size
         self.action_dim = action_dim
         self.action_type = action_type
+        self.num_particles = num_particles  # 存储粒子数量
+        
+        # 随机探索参数
+        self.random_exploration_steps = random_exploration_steps
+        self.total_steps = 0  # 总步数计数器
         
         # 网络初始化
         if num_particles is not None:
@@ -471,13 +478,36 @@ class SACAgent:
         self.print_network_parameters()
     
     def select_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
+        """选择动作 - 支持初始随机探索阶段"""
+        # 在随机探索阶段使用随机动作
+        if self.total_steps < self.random_exploration_steps and not deterministic:
+            return self._select_random_action()
+        
+        # 正常的SAC动作选择
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             action, _ = self.actor.sample(state_tensor, deterministic)
             return action.cpu().numpy()[0]
     
+    def _select_random_action(self) -> np.ndarray:
+        """随机选择动作 - 根据动作类型进行不同处理"""
+        if self.action_type == "continuous":
+            # 连续动作空间：在[0,1]范围内随机采样
+            return np.random.uniform(0, 1, self.action_dim)
+        elif self.action_type == "discrete":
+            # 离散动作空间：随机选择pick和place的粒子索引
+            if self.num_particles is None:
+                raise ValueError("num_particles must be specified for discrete action space")
+            pick_idx = np.random.randint(0, self.num_particles)
+            place_idx = np.random.randint(0, self.num_particles)
+            return np.array([pick_idx, place_idx], dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported action_type: {self.action_type}")
+    
     def store_transition(self, state, action, reward, next_state, done):
+        """存储经验并更新步数计数器"""
         self.replay_buffer.add(state, action, reward, next_state, done)
+        self.total_steps += 1
     
     def update(self):
         print('Replay buffer size: ', len(self.replay_buffer))

@@ -17,6 +17,8 @@ from daxbench.core.envs.basic.cloth_env import ClothEnv
 from daxbench.core.utils.util import get_expert_start_end_cloth
 from sklearn.cluster import KMeans
 
+from expert.fold_direction_langchain import *
+
 from icecream import ic as print
 
 my_path = os.path.dirname(os.path.abspath(__file__))
@@ -276,7 +278,11 @@ class FoldEnv(ClothEnv):
 
     def __init__(self, conf=None, aux_reward=False, seed=1, reward_type="final_goal", subgoals_dir=None):
         conf = DefaultConf() if conf is None else conf
-        max_steps = 2
+        task_steps = globals()[conf.task].steps()
+        self.max_subgoal_steps = 3
+        max_steps = self.max_subgoal_steps * task_steps
+
+
         self.batch_size = conf.batch_size
         self.cloth_type = conf.cloth_type
         self.reward_type = reward_type  # "final_goal", "subgoal", "combined", "final_goal_delta", "subgoal_delta"
@@ -295,7 +301,6 @@ class FoldEnv(ClothEnv):
         # 初始化子目标相关变量
         self.subgoals = []
         self.current_subgoal_idx = np.zeros(self.batch_size, dtype=int)
-        self.max_subgoal_steps = 2
         self.current_subgoal_step = np.zeros(self.batch_size, dtype=int)
 
         self.step_count = 0

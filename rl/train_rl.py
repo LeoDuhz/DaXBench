@@ -173,7 +173,8 @@ class RLTrainer:
                     alpha=self.config.get('alpha', 0.2),
                     buffer_size=self.config.get('buffer_size', 100000),
                     batch_size=self.config.get('rl_batch_size', 256),
-                    hidden_dim=self.config.get('hidden_dim', 256)
+                    hidden_dim=self.config.get('hidden_dim', 256),
+                    random_exploration_steps=self.config.get('random_exploration_steps', 15000)
                 )
             else:  # depth
                 obs_shape = (400, 600, 1)  # 固定深度图尺寸
@@ -186,7 +187,8 @@ class RLTrainer:
                     alpha=self.config.get('alpha', 0.2),
                     buffer_size=self.config.get('buffer_size', 100000),
                     batch_size=self.config.get('rl_batch_size', 256),
-                    hidden_dim=self.config.get('hidden_dim', 256)
+                    hidden_dim=self.config.get('hidden_dim', 256),
+                    random_exploration_steps=self.config.get('random_exploration_steps', 15000)
                 )
         else:
             raise ValueError(f"Unsupported algorithm: {algorithm}")
@@ -392,6 +394,13 @@ class RLTrainer:
                 'train/total_steps': self.total_steps,
                 'train/episode': episode
             }
+            
+            # 为SAC算法添加随机探索阶段的信息
+            if self.config['algorithm'].lower() == 'sac':
+                is_random_exploration = self.total_steps < self.agent.random_exploration_steps
+                train_log['train/random_exploration'] = int(is_random_exploration)
+                train_log['train/exploration_progress'] = min(1.0, self.total_steps / self.agent.random_exploration_steps)
+            
             print('Total steps: ', self.total_steps)
             # 更新智能体
             should_update = False
@@ -436,11 +445,22 @@ class RLTrainer:
             
             # 打印进度
             if episode % 10 == 0:
-                print(f"Episode {episode}: "
-                      f"Reward={episode_stats['episode_reward']:.2f}, "
-                      f"Steps={episode_stats['episode_steps']}, "
-                      f"Subgoals={episode_stats['subgoals_reached']}, "
-                      f"Success={episode_stats['success']}")
+                progress_msg = (f"Episode {episode}: "
+                               f"Reward={episode_stats['episode_reward']:.2f}, "
+                               f"Steps={episode_stats['episode_steps']}, "
+                               f"Subgoals={episode_stats['subgoals_reached']}, "
+                               f"Success={episode_stats['success']}")
+                
+                # 为SAC算法添加随机探索信息
+                if self.config['algorithm'].lower() == 'sac':
+                    is_random_exploration = self.total_steps < self.agent.random_exploration_steps
+                    if is_random_exploration:
+                        exploration_progress = self.total_steps / self.agent.random_exploration_steps
+                        progress_msg += f", 随机探索: {exploration_progress:.1%}"
+                    else:
+                        progress_msg += ", 策略探索"
+                
+                print(progress_msg)
         
         # 训练完成
         print("训练完成!")
@@ -487,6 +507,8 @@ def main():
                        help='隐藏层维度')
     parser.add_argument('--task', type=str, default='S_Corner_All_Middle',
                        help='任务名称')
+    parser.add_argument('--random_exploration_steps', type=int, default=10000,
+                       help='SAC算法随机探索步数')
     
     args = parser.parse_args()
     
@@ -531,6 +553,7 @@ def main():
         'alpha': 0.1,
         'buffer_size': 100000,
         'rl_batch_size': 512,
+        'random_exploration_steps': args.random_exploration_steps,
         
         # 环境参数
         'num_sampled_particles': args.num_sampled_particles,

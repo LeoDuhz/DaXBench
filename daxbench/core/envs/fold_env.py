@@ -380,7 +380,7 @@ class DefaultConf:
     batch_size = 10
     cloth_type = 'tshirt'
     task = "S_Corner_All_Middle"
-    id_range = list(range(0, 50))
+    id_range = list(range(0, 1))
     goal_path = f"{my_path}/goals/{task}/goal.npy"
     use_substep_obs = True
     record_video = False
@@ -441,6 +441,10 @@ class FoldEnv(ClothEnv):
         self.current_subgoal_idx = np.zeros(self.batch_size, dtype=int)
         self.current_subgoal_step = np.zeros(self.batch_size, dtype=int)
 
+        # 初始化子目标状态变量，避免AttributeError
+        self.subgoals_reached = None
+        self.episode_success = None
+
         self.step_count = 0
         
         # 初始化距离跟踪变量，用于基于距离变化的奖励计算
@@ -448,7 +452,7 @@ class FoldEnv(ClothEnv):
         self.prev_subgoal_distance = None
         
         # 加载子目标（如果提供了路径）
-        if self.subgoals_dir and self.reward_type in ["subgoal", "combined", "subgoal_delta"]:
+        if self.subgoals_dir and self.reward_type in ["subgoal", "combined", "subgoal_delta", "binary_subgoal"]:
             self._load_subgoals()
         
         self.init_compile()
@@ -572,8 +576,9 @@ class FoldEnv(ClothEnv):
             
             # 检查当前子目标索引是否超出范围
             if self.current_subgoal_idx[i] >= len(self.subgoals[i]):
+                print(f'In index {i}', f'current_subgoal_idx: {self.current_subgoal_idx[i]}', f'len(self.subgoals[i]): {len(self.subgoals[i])}')
                 rewards[i] = 0.0
-                subgoals_reached[i] = True
+                subgoals_reached[i] = False
                 continue
                 
             # 获取第i个环境的当前子目标
@@ -591,7 +596,7 @@ class FoldEnv(ClothEnv):
             # print(distance)
             # print(distance)
             # 奖励函数：距离越小奖励越大
-            subgoal_threshold = 0.01
+            subgoal_threshold = 0.012
 
             rewards[i] = np.exp(-distance * 30) if distance < subgoal_threshold*2 else -1
             # print(rewards[i])
@@ -603,6 +608,7 @@ class FoldEnv(ClothEnv):
             # else:
             #     print(f"distance: {distance}")
             subgoals_reached[i] = distance < subgoal_threshold  # 可调整阈值
+        # print(self.distances)
         return rewards, subgoals_reached
     
     def _calculate_final_goal_delta_reward(self, current_state):
@@ -649,7 +655,7 @@ class FoldEnv(ClothEnv):
                 
             if self.current_subgoal_idx[i] >= len(self.subgoals[i]):
                 current_distances[i] = 0.0
-                subgoals_reached[i] = True
+                subgoals_reached[i] = False
                 continue
                 
             # 获取当前子目标
@@ -663,7 +669,7 @@ class FoldEnv(ClothEnv):
             current_distances[i] = float(distance)
             self.distances[i] = distance
             # 检查是否达到子目标
-            subgoal_threshold = 0.01
+            subgoal_threshold = 0.012
             subgoals_reached[i] = distance < subgoal_threshold
         
         # 如果是第一步，初始化上一步距离
@@ -725,7 +731,7 @@ class FoldEnv(ClothEnv):
         self.info = info
         
         # 重置子目标状态
-        if self.reward_type in ["subgoal", "combined", "subgoal_delta"]:
+        if self.reward_type in ["subgoal", "combined", "subgoal_delta", "binary_subgoal"]:
             self.reset_subgoal_states()
         
         # 重置距离跟踪变量
@@ -756,6 +762,7 @@ class FoldEnv(ClothEnv):
 
         gt_keypoints_path = os.path.join(base_dir.replace('mask', 'gt_keypoints'), f"{mask_id}.pkl")
         if not os.path.exists(gt_keypoints_path):
+            print(f"GT keypoints {gt_keypoints_path} not found")
             gt_keypoints = None
         else:
             with open(gt_keypoints_path, 'rb') as f:
@@ -843,7 +850,7 @@ class FoldEnv(ClothEnv):
         reward = self._calculate_custom_reward(info['state'], base_reward)
         
         # 更新子目标信息到info中
-        if self.reward_type in ["subgoal", "combined", "subgoal_delta"]:
+        if self.reward_type in ["subgoal", "combined", "subgoal_delta", "binary_subgoal"]:
             subgoal_info = self._get_subgoal_info()
             info.update(subgoal_info)
         
@@ -856,7 +863,7 @@ class FoldEnv(ClothEnv):
         if visualize and visualize_path is not None:
             start = time.time()
             for i in range(0, self.batch_size):
-                if not ((self.subgoals_reached is not None and self.subgoals_reached[i])):
+                if not (i%5 == 0 and (self.subgoals_reached is not None and self.subgoals_reached[i])):
                     continue
                 rgb_before, _, = self.render(state_before, idx=i, visualize=False)
                 save_path = os.path.join(visualize_path, f"{i}_{self.chosen_ids[i]}",f'{self.step_count}')
@@ -865,7 +872,17 @@ class FoldEnv(ClothEnv):
                 
                 rgb_pnp = rgb_before.copy()
                 rgb_pc = rgb_before.copy()
-                x_sampled = spatial_sampling(state_before.x[i], self.num_sampled_particles, method=self.sampling_method)
+                valid_mask = (
+                    (state_before.x[i][:, 2] != 0) &      # z坐标不为0
+                    (state_before.x[i][:, 0] != 0) &      # x坐标不为0  
+                    (state_before.x[i][:, 0] > 0.1) &     # x坐标大于0.1
+                    (state_before.x[i][:, 0] < 0.9) &      # x坐标小于0.9
+                    (state_before.x[i][:, 2] > 0.1) &      # y坐标大于0.1
+                    (state_before.x[i][:, 2] < 0.9)       # y坐标小于0.9
+                )
+                valid_particles = state_before.x[i][valid_mask]
+                x_sampled = spatial_sampling(valid_particles, self.num_sampled_particles, method=self.sampling_method)
+  
                 for j in range(x_sampled.shape[0]):
                     cv2.circle(rgb_pc, (int(x_sampled[j, 0]*rgb_pnp.shape[1]), int(x_sampled[j, 2]*rgb_pnp.shape[0])), 5, (255, 0, 255), -1)
                     cv2.circle(rgb_pc, (int(x_sampled[j, 0]*rgb_pc.shape[1]), int(x_sampled[j, 2]*rgb_pc.shape[0])), 5, (255, 0, 255), -1)
@@ -997,10 +1014,32 @@ class FoldEnv(ClothEnv):
             rewards -= subgoal_timeout * 5.0
             
             return rewards
+            
+        elif self.reward_type == "binary_subgoal":            # 基于子目标的0-1奖励：失败时为0，每达成一个子目标+1，最终成功再+1
+            if len(self.subgoals) == 0:
+                # 如果没有子目标，使用简单的0-1奖励
+                return np.ones(self.batch_size) if np.any(base_reward > 0) else np.zeros(self.batch_size)
+            
+            subgoal_rewards, subgoals_reached = self._calculate_subgoal_reward(current_state)
+            episode_success, subgoal_advanced, subgoal_timeout = self._update_subgoal_states(subgoals_reached)
+            print(111)
+            self.subgoals_reached = subgoals_reached
+            self.episode_success = episode_success
+            
+            # 初始化为0的奖励
+            rewards = np.zeros(self.batch_size)
+            
+            # 每达成一个子目标+1
+            rewards += subgoals_reached.astype(float) * 1.0
+            
+            # 完成所有子目标（最终成功）再+1
+            # rewards += episode_success.astype(float) * 1.0
+            
+            return rewards
         
         else:
             raise ValueError(f"Unknown reward_type: {self.reward_type}. "
-                           f"Supported types: 'final_goal', 'subgoal', 'combined', 'final_goal_delta', 'subgoal_delta'")
+                           f"Supported types: 'final_goal', 'subgoal', 'combined', 'final_goal_delta', 'subgoal_delta', 'binary_subgoal'")
     
     def _get_subgoal_info(self):
         """获取子目标相关信息，每个环境可能有不同的子目标数量"""
@@ -1016,8 +1055,8 @@ class FoldEnv(ClothEnv):
             'subgoal_idx': self.current_subgoal_idx.copy(),
             'subgoal_step': self.current_subgoal_step.copy(),
             'total_subgoals': total_subgoals_per_env,
-            'subgoal_reached': self.subgoals_reached.copy(),
-            'episode_success': self.episode_success.copy(),
+            'subgoal_reached': self.subgoals_reached.copy() if self.subgoals_reached is not None else None,
+            'episode_success': self.episode_success.copy() if self.episode_success is not None else None,
             'max_subgoal_steps': self.max_subgoal_steps,
             'chosen_ids': self.chosen_ids.copy()
         }
@@ -1026,6 +1065,10 @@ class FoldEnv(ClothEnv):
         """重置子目标状态"""
         self.current_subgoal_idx = np.zeros(self.batch_size, dtype=int)
         self.current_subgoal_step = np.zeros(self.batch_size, dtype=int)
+        
+        # 重置子目标状态变量
+        self.subgoals_reached = None
+        self.episode_success = None
         
         # 如果使用基于距离变化的奖励，也重置距离跟踪变量
         if self.reward_type in ["final_goal_delta", "subgoal_delta"]:

@@ -13,7 +13,7 @@ from datetime import datetime
 sys.path.append('/root/DaXBench')
 
 from rl_env_wrapper import SingleRLClothFoldEnv, RLClothFoldEnv
-from rl_algorithms import PPOAgent, SACAgent
+from rl_algorithms import PPOAgent, SACAgent, DDPGAgent, DQNAgent
 from daxbench.core.envs.fold_env import DefaultConf
 
 from icecream import ic as print
@@ -55,6 +55,24 @@ class RLTrainer:
         env_conf.task = config.get('task', 'S_Corner_All_Middle')
         env_conf.sampling_method = config.get('sampling_method', 'farthest_point')
         env_conf.num_sampled_particles = config.get('num_sampled_particles', 15)
+        if config['algorithm'] == "dqn":
+            if env_conf.task.startswith('S'):
+                env_conf.id_range = [0, 2]
+            elif env_conf.task.startswith('T'):
+                env_conf.id_range = [6,11,19]
+            elif env_conf.task.startswith('P'):
+                env_conf.id_range = list(range(0, 1))
+            elif env_conf.task.startswith('R'):
+                env_conf.id_range = [0, 2]
+        else:
+            if env_conf.task.startswith('S'):
+                env_conf.id_range = [0, 2]
+            elif env_conf.task.startswith('T'):
+                env_conf.id_range = [6,11,19]
+            elif env_conf.task.startswith('P'):
+                env_conf.id_range = list(range(0, 1))
+            elif env_conf.task.startswith('R'):
+                env_conf.id_range = [0, 2]
         print(env_conf.task)
         if env_conf.task.startswith('S'):
             env_conf.cloth_type = 'square'
@@ -109,6 +127,7 @@ class RLTrainer:
         eval_conf.task = config.get('task', 'S_Corner_All_Middle')
         eval_conf.sampling_method = config.get('sampling_method', 'farthest_point')
         eval_conf.num_sampled_particles = config.get('num_sampled_particles', 15)
+        eval_conf.id_range = list(range(0, 50))
         if eval_conf.task.startswith('S'):
             eval_conf.cloth_type = 'square'
         elif eval_conf.task.startswith('T'):
@@ -119,7 +138,7 @@ class RLTrainer:
             eval_conf.cloth_type = 'rectangle'
         eval_conf.record_video = True  # 评估时记录视频
         eval_conf.seed = config.get('seed', 42)
-        self.eval_batch_size = 10
+        self.eval_batch_size = 50
         eval_conf.batch_size = self.eval_batch_size
         
         self.eval_env = RLClothFoldEnv(
@@ -149,7 +168,7 @@ class RLTrainer:
     
 
         
-    def _create_agent(self) -> Union[PPOAgent, SACAgent]:
+    def _create_agent(self) -> Union[PPOAgent, SACAgent, DDPGAgent]:
         """创建智能体"""
         algorithm = self.config['algorithm'].lower()
         action_type = self.config.get('action_type', 'continuous')
@@ -215,11 +234,62 @@ class RLTrainer:
                     hidden_dim=self.config.get('hidden_dim', 256),
                     random_exploration_steps=self.config.get('random_exploration_steps', 15000)
                 )
+        elif algorithm == 'ddpg':
+            if self.config['obs_type'] == 'particle':
+                return DDPGAgent(
+                    num_particles=num_particles,
+                    action_dim=action_dim,
+                    lr_actor=self.config.get('lr_actor', 1e-4),
+                    lr_critic=self.config.get('lr_critic', 1e-3),
+                    gamma=self.config.get('gamma', 0.6),
+                    tau=self.config.get('tau', 0.005),
+                    hidden_dim=self.config.get('hidden_dim', 256),
+                    buffer_capacity=self.config.get('buffer_size', 100000),
+                    batch_size=self.config.get('rl_batch_size', 256),
+                    noise_std=self.config.get('noise_std', 0.2)
+                )
+            else:  # depth
+                obs_shape = (400, 600, 1)  # 固定深度图尺寸
+                return DDPGAgent(
+                    obs_shape=obs_shape,
+                    action_dim=action_dim,
+                    lr_actor=self.config.get('lr_actor', 1e-4),
+                    lr_critic=self.config.get('lr_critic', 1e-3),
+                    gamma=self.config.get('gamma', 0.99),
+                    tau=self.config.get('tau', 0.005),
+                    hidden_dim=self.config.get('hidden_dim', 256),
+                    buffer_capacity=self.config.get('buffer_size', 100000),
+                    batch_size=self.config.get('rl_batch_size', 256),
+                    noise_std=self.config.get('noise_std', 0.2)
+                )
+        elif algorithm == 'dqn':
+            # DQN只支持粒子输入和离散动作空间
+            if self.config['obs_type'] != 'particle':
+                raise ValueError("DQN only supports particle observation type")
+            if action_type != "discrete":
+                raise ValueError("DQN only supports discrete action space")
+            
+            return DQNAgent(
+                num_particles=num_particles,
+                lr=self.config.get('lr', 1e-3),
+                gamma=self.config.get('gamma', 0.6),
+                epsilon_start=self.config.get('epsilon_start', 1.0),
+                epsilon_end=self.config.get('epsilon_end', 0.01),
+                epsilon_decay=self.config.get('epsilon_decay', 10000),
+                hidden_dim=self.config.get('hidden_dim', 256),
+                buffer_capacity=self.config.get('buffer_size', 100000),
+                batch_size=self.config.get('rl_batch_size', 256),
+                target_update_frequency=self.config.get('target_update_frequency', 1000)
+            )
         else:
             raise ValueError(f"Unsupported algorithm: {algorithm}")
     
     def train_episode(self) -> Dict[str, float]:
         """训练一个回合"""
+        # 为DDPG重置噪声
+        if self.config['algorithm'].lower() == 'ddpg' and hasattr(self.agent, 'reset_noise'):
+            self.agent.reset_noise()
+            
         obs = self.env.reset()
         episode_reward = 0
         episode_steps = 0
@@ -246,7 +316,23 @@ class RLTrainer:
                 # 批量环境：为每个环境生成动作
                 batch_actions = []
                 for i in range(batch_size):
-                    action = self.agent.select_action(obs[i], deterministic=False)
+                    if env_active[i] and not env_success[i]:  # 只为活跃且未成功的环境生成动作
+                        action = self.agent.select_action(obs[i], deterministic=False)
+                    else:
+                        # 为已成功或不活跃的环境生成无害的动作
+                        if self.config.get('action_type', 'continuous') == 'continuous':
+                            if self.config.get('single_arm', True):
+                                # 单臂：pick和place都在远离布料的位置 (-1, 0, -1)
+                                action = np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+                            else:
+                                # 双臂：两个臂都在远离布料的位置
+                                action = np.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+                        else:  # discrete
+                            # 离散动作空间：生成相同的pick和place索引，底层会处理为无害动作
+                            if self.config.get('single_arm', True):
+                                action = np.array([0, 0], dtype=np.float32)  # [pick_idx, place_idx] 相同
+                            else:
+                                action = np.array([0, 0, 0, 0], dtype=np.float32)  # [pick1, place1, pick2, place2] 都相同
                     batch_actions.append(action)
                 action = np.array(batch_actions)
             else:
@@ -263,10 +349,16 @@ class RLTrainer:
                 done_array = np.array(done) if not isinstance(done, np.ndarray) else done
                 
                 for i in range(batch_size):
-                    if hasattr(self.agent, 'store_reward_done'):  # PPO
-                        self.agent.store_reward_done(float(reward_array[i]), bool(done_array[i]))
-                    elif hasattr(self.agent, 'store_transition'):  # SAC
-                        self.agent.store_transition(obs[i], action[i], float(reward_array[i]), next_obs[i], bool(done_array[i]))
+                    # 只为活跃且未成功的环境存储经验，避免污染训练数据
+                    if env_active[i] and not env_success[i]:
+                        if self.config['algorithm'].lower() == 'ppo':  # PPO
+                            self.agent.store_reward_done(float(reward_array[i]), bool(done_array[i]))
+                        elif self.config['algorithm'].lower() == 'sac':  # SAC
+                            self.agent.store_transition(obs[i], action[i], float(reward_array[i]), next_obs[i], bool(done_array[i]))
+                        elif self.config['algorithm'].lower() == 'ddpg':  # DDPG
+                            self.agent.store_experience(obs[i], action[i], float(reward_array[i]), next_obs[i], bool(done_array[i]))
+                        elif self.config['algorithm'].lower() == 'dqn':  # DQN
+                            self.agent.store_transition(obs[i], action[i], float(reward_array[i]), next_obs[i], bool(done_array[i]))
                 
                 # 为每个环境累积奖励
                 env_episode_rewards += reward_array
@@ -287,23 +379,30 @@ class RLTrainer:
                         if 'subgoal_idx' in info and len(info['subgoal_idx']) > i:
                             env_max_subgoal_idx[i] = max(env_max_subgoal_idx[i], int(info['subgoal_idx'][i]))
                         
-                        # 成功标记 - 一旦成功就保持True
+                        # 成功标记 - 一旦成功就保持True，并停止为该环境生成有意义的动作
                         if 'episode_success' in info and len(info['episode_success']) > i and info['episode_success'][i]:
+                            if not env_success[i]:  # 首次成功时打印信息
+                                print(f"Environment {i} achieved success! Stopping meaningful actions for this env.")
                             env_success[i] = True
                         
                         # 如果环境完成，标记为不活跃
                         if len(done_array) > i and done_array[i]:
                             env_active[i] = False
                 
-                # 检查是否所有环境都完成
-                if not np.any(env_active):
+                # 检查是否所有环境都完成或成功
+                if not np.any(env_active) or np.all(env_success):
+                    print(f"All environments finished. Active: {np.sum(env_active)}, Successful: {np.sum(env_success)}")
                     break
                     
             else:
                 # 单环境
-                if hasattr(self.agent, 'store_reward_done'):  # PPO
+                if self.config['algorithm'].lower() == 'ppo':  # PPO
                     self.agent.store_reward_done(float(reward), bool(done))
-                elif hasattr(self.agent, 'store_transition'):  # SAC
+                elif self.config['algorithm'].lower() == 'sac':  # SAC
+                    self.agent.store_transition(obs, action, float(reward), next_obs, bool(done))
+                elif self.config['algorithm'].lower() == 'ddpg':  # DDPG
+                    self.agent.store_experience(obs, action, float(reward), next_obs, bool(done))
+                elif self.config['algorithm'].lower() == 'dqn':  # DQN
                     self.agent.store_transition(obs, action, float(reward), next_obs, bool(done))
                 
                 # 更新统计
@@ -356,8 +455,15 @@ class RLTrainer:
                 'individual_successes': int(episode_info['success'])
             }
     
-    def evaluate(self, num_episodes: int = 10, save_success_videos: bool = True) -> Dict[str, float]:
-        """评估智能体 - 使用批量环境"""
+    def evaluate(self, num_episodes: int = 10, save_success_videos: bool = True, 
+                 use_full_batch: bool = True) -> Dict[str, float]:
+        """评估智能体 - 使用批量环境，所有环境都执行有意义的动作
+        
+        Args:
+            num_episodes: 需要的评估回合数
+            save_success_videos: 是否保存成功的视频
+            use_full_batch: 当批量大小>需要评估数时，是否使用全部批量数据进行统计
+        """
         import random
         
         eval_rewards = []
@@ -369,11 +475,29 @@ class RLTrainer:
         
         # 计算需要多少轮来完成num_episodes个评估
         episodes_per_batch = self.eval_batch_size
-        num_batches = (num_episodes + episodes_per_batch - 1) // episodes_per_batch
+        
+        # 决定实际的评估策略
+        if episodes_per_batch >= num_episodes:
+            if use_full_batch:
+                # 使用全部批量大小的数据，获得更多统计信息
+                num_batches = 1
+                actual_episodes_to_collect = episodes_per_batch
+                print(f"使用全批量评估: 将收集 {episodes_per_batch} 个episode的数据 (需求: {num_episodes})")
+            else:
+                # 严格按需收集
+                num_batches = 1
+                actual_episodes_to_collect = num_episodes
+                print(f"严格按需评估: 将收集 {num_episodes} 个episode的数据")
+        else:
+            num_batches = (num_episodes + episodes_per_batch - 1) // episodes_per_batch
+            actual_episodes_to_collect = episodes_per_batch
+            print(f"多批次评估: {num_batches} 批次，每批 {episodes_per_batch} 个episode")
         
         total_evaluated = 0
         
         for batch_idx in range(num_batches):
+            print(f"评估批次 {batch_idx + 1}/{num_batches}")
+            
             # 重置评估环境并启用视频记录
             if save_success_videos:
                 self.eval_env.env.record_video = True
@@ -385,19 +509,12 @@ class RLTrainer:
             batch_success = np.zeros(episodes_per_batch, dtype=bool)
             
             while True:
-                # 为每个环境生成动作
+                # 为每个环境生成动作 - 所有环境都使用智能体的真实动作
                 batch_actions = []
                 for i in range(episodes_per_batch):
-                    if total_evaluated + i < num_episodes:
-                        action = self.agent.select_action(obs[i], deterministic=True)
-                        batch_actions.append(action)
-                    else:
-                        # 超出需要评估的数量，使用零动作
-                        # 默认动作维度
-                        action_dim = 4 if self.config.get('single_arm', True) else 8
-                        action = np.zeros(action_dim)
-                        batch_actions.append(action)
-                
+                    action = self.agent.select_action(obs[i], deterministic=True)
+                    batch_actions.append(action)
+
                 action = np.array(batch_actions)
                 obs, rewards, done, info = self.eval_env.step(action)
                 
@@ -410,14 +527,15 @@ class RLTrainer:
                     batch_success |= info['episode_success']
                 
                 # 检查是否有环境完成
-                if np.any(done):
+                if np.all(done):
                     break
             
             # 收集成功的episode数据
             if save_success_videos:
                 episode_data = self.eval_env.env.get_episode_data()
-                for i in range(episodes_per_batch):
-                    if total_evaluated + i < num_episodes and batch_success[i]:
+                episodes_to_save = min(episodes_per_batch, num_episodes - len(success_episodes))
+                for i in range(episodes_to_save):
+                    if batch_success[i]:
                         # 记录成功的episode信息
                         success_info = {
                             'batch_idx': i,
@@ -429,16 +547,30 @@ class RLTrainer:
                         success_episodes.append(success_info)
             
             # 收集这一批的结果
-            for i in range(episodes_per_batch):
-                if total_evaluated < num_episodes:
-                    eval_rewards.append(float(batch_episode_rewards[i]))
-                    eval_successes.append(bool(batch_success[i]))
-                    eval_subgoals.append(int(batch_subgoals_reached[i]))
-                    total_evaluated += 1
+            if use_full_batch and episodes_per_batch >= num_episodes and batch_idx == 0:
+                # 使用全部批量数据
+                episodes_to_collect = episodes_per_batch
+            else:
+                # 按需收集或多批次情况
+                episodes_to_collect = min(actual_episodes_to_collect, 
+                                        num_episodes - total_evaluated if not use_full_batch else episodes_per_batch)
+            
+            for i in range(episodes_to_collect):
+                eval_rewards.append(float(batch_episode_rewards[i]))
+                eval_successes.append(bool(batch_success[i]))
+                eval_subgoals.append(int(batch_subgoals_reached[i]))
+                total_evaluated += 1
+            
+            # 如果已经收集够了（非use_full_batch模式），就停止
+            if not use_full_batch and total_evaluated >= num_episodes:
+                break
         
         # 保存成功episode的视频
         if save_success_videos and success_episodes:
             self._save_success_videos(success_episodes)
+        
+        print(f"评估完成: 收集了 {len(eval_rewards)} 个episode的数据")
+        print(f"平均奖励: {np.mean(eval_rewards):.2f}, 成功率: {np.mean(eval_successes):.2%}")
         
         return {
             'eval_reward_mean': float(np.mean(eval_rewards)),
@@ -446,7 +578,8 @@ class RLTrainer:
             'eval_success_rate': float(np.mean(eval_successes)),
             'eval_subgoals_mean': float(np.mean(eval_subgoals)),
             'eval_subgoals_std': float(np.std(eval_subgoals)),
-            'num_success_episodes': len(success_episodes)
+            'num_success_episodes': len(success_episodes),
+            'total_episodes_evaluated': len(eval_rewards)  # 新增：实际评估的episode数量
         }
     
     def _save_success_videos(self, success_episodes):
@@ -600,6 +733,18 @@ class RLTrainer:
                   len(self.agent.replay_buffer) > self.config.get('rl_batch_size', 256)):
                 update_stats = self.agent.update()
                 train_log.update({f'train/{k}': v for k, v in update_stats.items()})
+            elif (self.config['algorithm'].lower() == 'ddpg' and 
+                  isinstance(self.agent, DDPGAgent) and
+                  hasattr(self.agent, 'replay_buffer') and
+                  len(self.agent.replay_buffer) > self.config.get('rl_batch_size', 256)):
+                update_stats = self.agent.update()
+                train_log.update({f'train/{k}': v for k, v in update_stats.items()})
+            elif (self.config['algorithm'].lower() == 'dqn' and 
+                  isinstance(self.agent, DQNAgent) and
+                  hasattr(self.agent, 'replay_buffer') and
+                  len(self.agent.replay_buffer) > self.config.get('rl_batch_size', 256)):
+                update_stats = self.agent.update()
+                train_log.update({f'train/{k}': v for k, v in update_stats.items()})
             
             # 评估
             if episode % eval_frequency == 0:
@@ -659,7 +804,7 @@ class RLTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description='布料折叠强化学习训练 - 支持批量环境')
-    parser.add_argument('--algorithm', type=str, choices=['ppo', 'sac'], 
+    parser.add_argument('--algorithm', type=str, choices=['ppo', 'sac', 'ddpg', 'dqn'], 
                        default='ppo', help='强化学习算法')
     parser.add_argument('--obs_type', type=str, choices=['particle', 'depth'],
                        default='particle', help='观察类型')
@@ -674,7 +819,7 @@ def main():
     parser.add_argument('--cloth_type', type=str, default='square',
                        help='布料类型')
     parser.add_argument('--reward_type', type=str, default='final_goal',
-                       help='奖励类型')
+                       help='奖励类型: final_goal, subgoal, combined, final_goal_delta, subgoal_delta, binary_subgoal')
     parser.add_argument('--max_episodes', type=int, default=5000,
                        help='最大训练回合数')
     parser.add_argument('--lr', type=float, default=3e-4,
@@ -683,7 +828,7 @@ def main():
                        help='随机种子')
     parser.add_argument('--save_dir', type=str, default='./rl_results',
                        help='结果保存目录')
-    parser.add_argument('--project_name', type=str, default='cloth-folding-rl',
+    parser.add_argument('--project_name', type=str, default='cloth-folding-RL',
                        help='SwanLab项目名称')
     parser.add_argument('--experiment_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S"),
                        help='实验名称')
@@ -699,6 +844,20 @@ def main():
                        help='任务名称')
     parser.add_argument('--random_exploration_steps', type=int, default=10000,
                        help='SAC算法随机探索步数')
+    parser.add_argument('--lr_actor', type=float, default=1e-4,
+                       help='DDPG算法Actor学习率')
+    parser.add_argument('--lr_critic', type=float, default=1e-3,
+                       help='DDPG算法Critic学习率')
+    parser.add_argument('--noise_std', type=float, default=0.2,
+                       help='DDPG算法噪声标准差')
+    parser.add_argument('--epsilon_start', type=float, default=1.0,
+                       help='DQN算法初始epsilon值')
+    parser.add_argument('--epsilon_end', type=float, default=0.01,
+                       help='DQN算法最终epsilon值')
+    parser.add_argument('--epsilon_decay', type=int, default=10000,
+                       help='DQN算法epsilon衰减步数')
+    parser.add_argument('--target_update_frequency', type=int, default=1000,
+                       help='DQN算法目标网络更新频率')
     
     args = parser.parse_args()
     
@@ -726,7 +885,7 @@ def main():
         'experiment_name': args.experiment_name or f"{args.algorithm}_{args.obs_type}_{int(time.time())}",
         'task': args.task,
         # 训练参数
-        'gamma': 0.6,
+        'gamma': 0.95,
         'hidden_dim': args.hidden_dim,
         'max_subgoal_steps': 2,
         'eval_frequency': 20,
@@ -740,10 +899,21 @@ def main():
         
         # SAC特定参数
         'tau': 0.005,
-        'alpha': 0.1,
+        'alpha': 0.2,
         'buffer_size': 100000,
         'rl_batch_size': 512,
         'random_exploration_steps': args.random_exploration_steps,
+        
+        # DDPG特定参数
+        'lr_actor': args.lr_actor,
+        'lr_critic': args.lr_critic,
+        'noise_std': args.noise_std,
+        
+        # DQN特定参数
+        'epsilon_start': args.epsilon_start,
+        'epsilon_end': args.epsilon_end,
+        'epsilon_decay': args.epsilon_decay,
+        'target_update_frequency': args.target_update_frequency,
         
         # 环境参数
         'num_sampled_particles': args.num_sampled_particles,

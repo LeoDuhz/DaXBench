@@ -171,12 +171,9 @@ class RLClothFoldEnv(gym.Env):
         return env_action
     
     def _convert_discrete_action(self, action: np.ndarray, batch_size: int) -> np.ndarray:
-        """转换离散动作到连续坐标 - 使用缓存的采样粒子数据"""
-        # Use cached sampled particles if available, otherwise fall back to original sampling
-        if self.cached_sampled_particles is not None:
-            sampled_particles_list = self.cached_sampled_particles
-        else:
-            # Fallback: sample particles if cache is not available
+        """转换离散动作 - 粒子索引转换为坐标"""
+        # Cache sampled particles for all batches
+        if not hasattr(self, 'cached_sampled_particles') or self.cached_sampled_particles is None:
             state = self.env.get_state()
             sampled_particles_list = []
             for i in range(batch_size):
@@ -187,7 +184,11 @@ class RLClothFoldEnv(gym.Env):
                     sampled_state = valid_particles
                 else:
                     sampled_state = spatial_sampling(valid_particles, self.num_sampled_particles, method=self.sampling_method)
+
                 sampled_particles_list.append(sampled_state)
+            self.cached_sampled_particles = sampled_particles_list
+        else:
+            sampled_particles_list = self.cached_sampled_particles
         
         if self.single_arm:
             # action shape: (batch_size, 2) - [pick_idx, place_idx]
@@ -197,9 +198,26 @@ class RLClothFoldEnv(gym.Env):
                 pick_idx = int(action[i, 0])
                 place_idx = int(action[i, 1])
                 
+                # 检查是否为无效动作（pick和place索引相同）
+                if pick_idx == place_idx and pick_idx == 0:
+                    # 生成无害的动作：将pick和place都设置在远离布料的位置
+                    # 使用 (-1, 0, -1) 坐标，这个位置远离布料范围 [0, 1]
+                    print(f'invalid action: {i}', 'pick_idx', pick_idx, 'position', sampled_particles_list[i][pick_idx, :])
+                    env_action[i, 0] = -1.0   # pick_x
+                    env_action[i, 1] = 0.0    # pick_y (固定为0)
+                    env_action[i, 2] = -1.0   # pick_z
+                    env_action[i, 3] = -1.0   # place_x (与pick相同，无移动)
+                    env_action[i, 4] = 0.0    # place_y (固定为0)
+                    env_action[i, 5] = -1.0   # place_z (与pick相同，无移动)
+                    # 复制到第二个臂
+                    env_action[i, 6:12] = env_action[i, 0:6]
+                    continue
+                
                 # Use cached sampled particles
                 sampled_state = sampled_particles_list[i]
-                
+                # print(sampled_state[:, 0].min(), sampled_state[:, 0].max())
+                # print(sampled_state[:, 1].min(), sampled_state[:, 1].max())
+                # print(sampled_state[:, 2].min(), sampled_state[:, 2].max())
                 # 确保索引不越界
                 max_idx = sampled_state.shape[0] - 1
                 pick_idx = min(pick_idx, max_idx)
@@ -233,27 +251,45 @@ class RLClothFoldEnv(gym.Env):
                 pick2_idx = min(int(action[i, 2]), max_idx)
                 place2_idx = min(int(action[i, 3]), max_idx)
                 
-                # 第一个臂的坐标
-                pick1_pos = sampled_state[pick1_idx, :]
-                place1_pos = sampled_state[place1_idx, :]
-                # 第二个臂的坐标
-                pick2_pos = sampled_state[pick2_idx, :]
-                place2_pos = sampled_state[place2_idx, :]
+                # 检查第一个臂是否为无效动作
+                if pick1_idx == place1_idx:
+                    # 第一个臂无效动作：设置在远离布料的位置
+                    env_action[i, 0] = -1.0   # pick1_x
+                    env_action[i, 1] = 0.0    # pick1_y
+                    env_action[i, 2] = -1.0   # pick1_z
+                    env_action[i, 3] = -1.0   # place1_x
+                    env_action[i, 4] = 0.0    # place1_y
+                    env_action[i, 5] = -1.0   # place1_z
+                else:
+                    # 第一个臂正常动作
+                    pick1_pos = sampled_state[pick1_idx, :]
+                    place1_pos = sampled_state[place1_idx, :]
+                    env_action[i, 0] = pick1_pos[0]   # pick1_x
+                    env_action[i, 1] = 0              # pick1_y
+                    env_action[i, 2] = pick1_pos[2]   # pick1_z
+                    env_action[i, 3] = place1_pos[0]  # place1_x
+                    env_action[i, 4] = 0              # place1_y
+                    env_action[i, 5] = place1_pos[2]  # place1_z
                 
-                # 第一个臂动作
-                env_action[i, 0] = pick1_pos[0]   # pick1_x
-                env_action[i, 1] = 0              # pick1_y
-                env_action[i, 2] = pick1_pos[2]   # pick1_z
-                env_action[i, 3] = place1_pos[0]  # place1_x
-                env_action[i, 4] = 0              # place1_y
-                env_action[i, 5] = place1_pos[2]  # place1_z
-                # 第二个臂动作
-                env_action[i, 6] = pick2_pos[0]   # pick2_x
-                env_action[i, 7] = 0              # pick2_y
-                env_action[i, 8] = pick2_pos[2]   # pick2_z
-                env_action[i, 9] = place2_pos[0]  # place2_x
-                env_action[i, 10] = 0             # place2_y
-                env_action[i, 11] = place2_pos[2] # place2_z
+                # 检查第二个臂是否为无效动作
+                if pick2_idx == place2_idx:
+                    # 第二个臂无效动作：设置在远离布料的位置
+                    env_action[i, 6] = -1.0   # pick2_x
+                    env_action[i, 7] = 0.0    # pick2_y
+                    env_action[i, 8] = -1.0   # pick2_z
+                    env_action[i, 9] = -1.0   # place2_x
+                    env_action[i, 10] = 0.0   # place2_y
+                    env_action[i, 11] = -1.0  # place2_z
+                else:
+                    # 第二个臂正常动作
+                    pick2_pos = sampled_state[pick2_idx, :]
+                    place2_pos = sampled_state[place2_idx, :]
+                    env_action[i, 6] = pick2_pos[0]   # pick2_x
+                    env_action[i, 7] = 0              # pick2_y
+                    env_action[i, 8] = pick2_pos[2]   # pick2_z
+                    env_action[i, 9] = place2_pos[0]  # place2_x
+                    env_action[i, 10] = 0             # place2_y
+                    env_action[i, 11] = place2_pos[2] # place2_z
                 
         return env_action
     
@@ -266,8 +302,15 @@ class RLClothFoldEnv(gym.Env):
             sampled_particles_cache = []  # Cache sampled particles for action conversion
             
             for i in range(self.batch_size):
-                # 过滤掉第三个维度（y坐标）为0的粒子
-                valid_mask = state.x[i][:, 2] != 0  # y坐标不为0的粒子
+                # 过滤掉无效粒子
+                valid_mask = (
+                    (state.x[i][:, 2] != 0) &      # z坐标不为0
+                    (state.x[i][:, 0] != 0) &      # x坐标不为0  
+                    (state.x[i][:, 0] > 0.1) &     # x坐标大于0.1
+                    (state.x[i][:, 0] < 0.9) &      # x坐标小于0.9
+                    (state.x[i][:, 2] > 0.1) &      # y坐标大于0.1
+                    (state.x[i][:, 2] < 0.9)       # y坐标小于0.9
+                )
                 valid_particles = state.x[i][valid_mask]
                 
                 # 使用空间采样算法

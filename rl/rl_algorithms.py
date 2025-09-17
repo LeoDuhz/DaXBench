@@ -55,6 +55,17 @@ class ActorCritic(nn.Module):
         
         # Critic网络 (价值网络)
         self.critic = nn.Linear(hidden_dim, 1)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            if 'logits' in str(m):  # 对输出层使用较小的初始化
+                torch.nn.init.orthogonal_(m.weight, gain=0.01)
+            else:
+                torch.nn.init.orthogonal_(m.weight, gain=1.0)
+            torch.nn.init.constant_(m.bias, 0)
+
+    
         
     def forward(self, obs: torch.Tensor):
         # obs shape: (batch_size, num_particles, 3)
@@ -271,7 +282,7 @@ class PPOAgent:
         self.buffer['dones'].append(done)
     
     def update(self):
-        # 计算折扣奖励
+        # 计算折扣奖励（不标准化）
         rewards = []
         discounted_reward = 0
         for reward, done in zip(reversed(self.buffer['rewards']), reversed(self.buffer['dones'])):
@@ -280,40 +291,50 @@ class PPOAgent:
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
         
-        # 标准化奖励
         rewards = torch.FloatTensor(rewards).to(self.device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         
         # 转换为张量
         old_states = torch.FloatTensor(np.array(self.buffer['states'])).to(self.device)
         old_actions = torch.FloatTensor(np.array(self.buffer['actions'])).to(self.device)
         old_log_probs = torch.FloatTensor(self.buffer['log_probs']).to(self.device)
         old_values = torch.FloatTensor(self.buffer['values']).to(self.device)
-   
-        # 计算优势
+
+        # 计算优势（只标准化一次）
         advantages = rewards - old_values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
+        # 添加调试信息
+        print(f"=== PPO Update Debug ===")
+        print(f"Action type: {self.action_type}")
+        print(f"Buffer size: states={len(self.buffer['states'])}, rewards={len(self.buffer['rewards'])}")
+        print(f"Rewards: mean={rewards.mean():.6f}, std={rewards.std():.6f}, range=[{rewards.min():.6f}, {rewards.max():.6f}]")
+        print(f"Values: mean={old_values.mean():.6f}, std={old_values.std():.6f}")
+        print(f"Advantages: mean={advantages.mean():.6f}, std={advantages.std():.6f}")
+        print(f"Old log_probs: mean={old_log_probs.mean():.6f}, std={old_log_probs.std():.6f}")
+        
         # PPO更新
-        for _ in range(self.k_epochs):
+        for epoch in range(self.k_epochs):
             if self.action_type == "continuous":
                 # 连续动作空间的PPO更新
-                # 获取当前策略的输出
                 if hasattr(self.policy, 'conv_net'):
-                    # 深度图网络
                     action_mean, action_std, values = self.policy(old_states)
                 else:
-                    # 粒子网络
                     action_mean, action_std, values = self.policy(old_states)
                 
                 dist = Normal(action_mean, action_std)
-                # 将 old_actions∈[0,1] 逆映射回未约束空间 u=atanh(2a-1)
+                
+                # 修正：使用与get_action一致的计算方式
                 a = torch.clamp(old_actions, 0.0, 1.0)
-                pre_tanh = torch.atanh(torch.clamp(2.0 * a - 1.0, -1 + 1e-6, 1 - 1e-6))
+                # 逆变换：[0,1] -> [-1,1] -> pre_tanh
+                a_scaled = 2.0 * a - 1.0  # [0,1] -> [-1,1]
+                pre_tanh = torch.atanh(torch.clamp(a_scaled, -1 + 1e-6, 1 - 1e-6))
+                
+                # 重新计算log_prob（与get_action保持一致）
                 eps = 1e-6
-                new_log_probs = dist.log_prob(pre_tanh) - torch.log(1 - torch.tanh(pre_tanh).pow(2) + eps)
-                new_log_probs = new_log_probs.sum(dim=-1)
+                new_log_probs = dist.log_prob(pre_tanh).sum(dim=-1)
+                new_log_probs = new_log_probs - torch.log(1 - a_scaled.pow(2) + eps).sum(dim=-1)
                 new_log_probs = new_log_probs - a.shape[-1] * np.log(2.0)
+                
                 entropy = dist.entropy().sum(dim=-1)
                 
             elif self.action_type == "discrete":
@@ -328,13 +349,35 @@ class PPOAgent:
                 old_pick_actions = old_actions[:, 0].long()
                 old_place_actions = old_actions[:, 1].long()
                 
-                # 计算新的log概率
+                # 计算新的log概率（与get_action保持一致）
                 pick_log_probs = pick_dist.log_prob(old_pick_actions)
                 place_log_probs = place_dist.log_prob(old_place_actions)
                 new_log_probs = pick_log_probs + place_log_probs
                 
                 # 计算熵
                 entropy = pick_dist.entropy() + place_dist.entropy()
+                
+                # 调试信息（离散动作空间特有）
+                if epoch == 0:
+                    print(f"Pick actions range: [{old_pick_actions.min():.0f}, {old_pick_actions.max():.0f}]")
+                    print(f"Place actions range: [{old_place_actions.min():.0f}, {old_place_actions.max():.0f}]")
+                    print(f"Pick logits: mean={pick_logits.mean():.6f}, std={pick_logits.std():.6f}")
+                    print(f"Place logits: mean={place_logits.mean():.6f}, std={place_logits.std():.6f}")
+                    print(f"Pick log_probs: mean={pick_log_probs.mean():.6f}, std={pick_log_probs.std():.6f}")
+                    print(f"Place log_probs: mean={place_log_probs.mean():.6f}, std={place_log_probs.std():.6f}")
+        
+            # 调试信息（通用）
+            if epoch == 0:
+                print(f"New log_probs: mean={new_log_probs.mean():.6f}, std={new_log_probs.std():.6f}")
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                print(f"Log prob diff: mean={(new_log_probs - old_log_probs).mean():.6f}, std={(new_log_probs - old_log_probs).std():.6f}")
+                print(f"Ratio: mean={ratio.mean():.6f}, std={ratio.std():.6f}, range=[{ratio.min():.6f}, {ratio.max():.6f}]")
+                
+                # 检查是否有异常值
+                if torch.any(torch.isnan(ratio)) or torch.any(torch.isinf(ratio)):
+                    print("WARNING: Ratio contains NaN or Inf values!")
+                if torch.any(ratio < 0):
+                    print("WARNING: Ratio contains negative values!")
             
             # 计算比率
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -347,7 +390,14 @@ class PPOAgent:
             critic_loss = F.mse_loss(values.squeeze(), rewards)
             entropy_loss = -entropy.mean()
             
-            total_loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
+            # 修正权重
+            total_loss = 100*actor_loss + 0.1 * critic_loss + 0.01 * entropy_loss
+            
+            if epoch == 0:
+                print(f"Raw losses - Actor: {actor_loss.item():.6f}, Critic: {critic_loss.item():.6f}, Entropy: {entropy_loss.item():.6f}")
+                print(f"Surr1: mean={surr1.mean():.6f}, std={surr1.std():.6f}")
+                print(f"Surr2: mean={surr2.mean():.6f}, std={surr2.std():.6f}")
+                print(f"Min(surr1, surr2): mean={torch.min(surr1, surr2).mean():.6f}")
             
             self.optimizer.zero_grad()
             total_loss.backward()
@@ -361,7 +411,12 @@ class PPOAgent:
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
             'entropy_loss': entropy_loss.item(),
-            'total_loss': total_loss.item()
+            'total_loss': total_loss.item(),
+            # 添加调试信息
+            'advantages_mean': advantages.mean().item(),
+            'advantages_std': advantages.std().item(),
+            'ratio_mean': ratio.mean().item(),
+            'log_prob_diff_mean': (new_log_probs - old_log_probs).mean().item()
         }
     
     def print_network_parameters(self):
@@ -470,7 +525,8 @@ class SACAgent:
             self.target_entropy = -np.log(1.0 / action_dim) * 2 
         else:
             self.target_entropy = -action_dim
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.log_alpha = torch.log(torch.tensor([alpha], device=device))  # 用初始alpha值初始化log_alpha
+        self.log_alpha.requires_grad = True
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
         
         # 打印网络参数量
@@ -644,6 +700,8 @@ class SACActorParticle(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 128),
             nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU()
         )
@@ -652,6 +710,8 @@ class SACActorParticle(nn.Module):
         particle_feature_dim = num_particles * 64
         self.net = nn.Sequential(
             nn.Linear(particle_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
@@ -667,14 +727,15 @@ class SACActorParticle(nn.Module):
         else:
             raise ValueError(f"Unsupported action_type: {action_type}")
         
-        self._init_weights()
+        self.apply(self._init_weights)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            if 'logits' in str(m):  # 对输出层使用较小的初始化
+                torch.nn.init.orthogonal_(m.weight, gain=0.01)
+            else:
+                torch.nn.init.orthogonal_(m.weight, gain=1.0)
+            torch.nn.init.constant_(m.bias, 0)
         
         # 特别处理输出层
         if self.action_type == "continuous":
@@ -888,7 +949,10 @@ class SACCriticDepth(nn.Module):
             obs = obs.permute(0, 3, 1, 2)
         
         conv_features = self.conv_net(obs)
-        return self.fc(torch.cat([conv_features, action], dim=-1))
+        state_action = torch.cat([conv_features, action], dim=-1)
+        q_value = self.fc(state_action)
+        
+        return q_value
 
 
 class ReplayBuffer:
@@ -907,3 +971,748 @@ class ReplayBuffer:
     
     def __len__(self):
         return len(self.buffer)
+
+# DDPG算法实现
+class DDPGActorParticle(nn.Module):
+    """DDPG算法的Actor网络 - 粒子输入版本"""
+    
+    def __init__(self, num_particles: int, action_dim: int, hidden_dim: int = 512):
+        super(DDPGActorParticle, self).__init__()
+        self.action_dim = action_dim
+        self.num_particles = num_particles
+        
+        # 粒子特征提取层
+        self.particle_encoder = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        # 全局特征聚合
+        particle_feature_dim = num_particles * 64
+        self.net = nn.Sequential(
+            nn.Linear(particle_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Actor输出层
+        self.action_head = nn.Linear(hidden_dim, action_dim)
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.orthogonal_(m.weight, 1.0)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        
+        # 输出层使用较小的初始化
+        torch.nn.init.uniform_(self.action_head.weight, -3e-3, 3e-3)
+        if self.action_head.bias is not None:
+            torch.nn.init.uniform_(self.action_head.bias, -3e-3, 3e-3)
+        
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            obs: shape (batch_size, num_particles, 3)
+        Returns:
+            action: shape (batch_size, action_dim), 范围[0, 1]
+        """
+        batch_size = obs.shape[0]
+        
+        # 处理每个粒子的特征
+        particles_flat = obs.reshape(-1, 3)
+        particle_features = self.particle_encoder(particles_flat)
+        particle_features = particle_features.reshape(batch_size, self.num_particles, 64)
+        global_features = particle_features.reshape(batch_size, -1)
+        
+        # 全局特征编码
+        features = self.net(global_features)
+        
+        # 输出动作，使用sigmoid确保在[0,1]范围内
+        action = torch.sigmoid(self.action_head(features))
+        
+        return action
+
+
+class DDPGCriticParticle(nn.Module):
+    """DDPG算法的Critic网络 - 粒子输入版本"""
+    
+    def __init__(self, num_particles: int, action_dim: int, hidden_dim: int = 512):
+        super(DDPGCriticParticle, self).__init__()
+        self.num_particles = num_particles
+        
+        # 粒子特征提取层
+        self.particle_encoder = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        # 状态-动作特征融合网络
+        particle_feature_dim = num_particles * 64
+        self.net = nn.Sequential(
+            nn.Linear(particle_feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.orthogonal_(m.weight, 1.0)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+    
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            obs: shape (batch_size, num_particles, 3)
+            action: shape (batch_size, action_dim)
+        Returns:
+            q_value: shape (batch_size, 1)
+        """
+        batch_size = obs.shape[0]
+        
+        # 处理每个粒子的特征
+        particles_flat = obs.reshape(-1, 3)
+        particle_features = self.particle_encoder(particles_flat)
+        particle_features = particle_features.reshape(batch_size, self.num_particles, 64)
+        global_features = particle_features.reshape(batch_size, -1)
+        
+        # 状态-动作特征融合
+        state_action = torch.cat([global_features, action], dim=-1)
+        q_value = self.net(state_action)
+        
+        return q_value
+
+
+class DDPGActorDepth(nn.Module):
+    """DDPG算法的Actor网络 - 深度图输入版本"""
+    
+    def __init__(self, obs_shape: Tuple[int, int, int], action_dim: int, hidden_dim: int = 512):
+        super(DDPGActorDepth, self).__init__()
+        
+        # 卷积特征提取
+        self.conv_net = nn.Sequential(
+            nn.Conv2d(obs_shape[2], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        conv_output_size = self._get_conv_output_size(obs_shape)
+        
+        # 全连接层
+        self.fc = nn.Sequential(
+            nn.Linear(conv_output_size, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Actor输出层
+        self.action_head = nn.Linear(hidden_dim, action_dim)
+        
+        # 输出层初始化
+        torch.nn.init.uniform_(self.action_head.weight, -3e-3, 3e-3)
+        torch.nn.init.uniform_(self.action_head.bias, -3e-3, 3e-3)
+    
+    def _get_conv_output_size(self, input_shape):
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, input_shape[2], input_shape[0], input_shape[1])
+            output = self.conv_net(dummy_input)
+            return output.shape[1]
+    
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            obs: shape (batch_size, height, width, channels) 或 (batch_size, channels, height, width)
+        Returns:
+            action: shape (batch_size, action_dim), 范围[0, 1]
+        """
+        # 确保输入格式为 (batch_size, channels, height, width)
+        if obs.dim() == 4 and obs.shape[-1] in [1, 3]:
+            obs = obs.permute(0, 3, 1, 2)
+        
+        conv_features = self.conv_net(obs)
+        features = self.fc(conv_features)
+        action = torch.sigmoid(self.action_head(features))
+        
+        return action
+
+
+class DDPGCriticDepth(nn.Module):
+    """DDPG算法的Critic网络 - 深度图输入版本"""
+    
+    def __init__(self, obs_shape: Tuple[int, int, int], action_dim: int, hidden_dim: int = 512):
+        super(DDPGCriticDepth, self).__init__()
+        
+        # 卷积特征提取
+        self.conv_net = nn.Sequential(
+            nn.Conv2d(obs_shape[2], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        conv_output_size = self._get_conv_output_size(obs_shape)
+        
+        # 状态-动作特征融合网络
+        self.fc = nn.Sequential(
+            nn.Linear(conv_output_size + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    
+    def _get_conv_output_size(self, input_shape):
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, input_shape[2], input_shape[0], input_shape[1])
+            output = self.conv_net(dummy_input)
+            return output.shape[1]
+    
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            obs: shape (batch_size, height, width, channels) 或 (batch_size, channels, height, width)
+            action: shape (batch_size, action_dim)
+        Returns:
+            q_value: shape (batch_size, 1)
+        """
+        # 确保输入格式为 (batch_size, channels, height, width)
+        if obs.dim() == 4 and obs.shape[-1] in [1, 3]:
+            obs = obs.permute(0, 3, 1, 2)
+        
+        conv_features = self.conv_net(obs)
+        state_action = torch.cat([conv_features, action], dim=-1)
+        q_value = self.fc(state_action)
+        
+        return q_value
+
+
+class OUNoise:
+    """Ornstein-Uhlenbeck噪声，用于DDPG的动作探索"""
+    
+    def __init__(self, action_dim: int, mu: float = 0.0, theta: float = 0.15, sigma: float = 0.2):
+        self.action_dim = action_dim
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.state = np.ones(self.action_dim) * self.mu
+        
+    def reset(self):
+        """重置噪声状态"""
+        self.state = np.ones(self.action_dim) * self.mu
+        
+    def sample(self) -> np.ndarray:
+        """采样噪声"""
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(len(x))
+        self.state = x + dx
+        return self.state
+
+
+class DDPGAgent:
+    """DDPG算法实现"""
+    
+    def __init__(self, 
+                 num_particles: int = None,
+                 obs_shape: Tuple[int, int, int] = None,
+                 action_dim: int = 4,
+                 lr_actor: float = 1e-4,
+                 lr_critic: float = 1e-3,
+                 gamma: float = 0.99,
+                 tau: float = 0.005,
+                 hidden_dim: int = 512,
+                 buffer_capacity: int = 1000000,
+                 batch_size: int = 256,
+                 noise_std: float = 0.2,
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        
+        self.device = device
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+        self.action_dim = action_dim
+        
+        # 根据输入类型选择网络
+        if num_particles is not None:
+            # 粒子位置输入
+            self.actor = DDPGActorParticle(num_particles, action_dim, hidden_dim).to(device)
+            self.target_actor = DDPGActorParticle(num_particles, action_dim, hidden_dim).to(device)
+            self.critic = DDPGCriticParticle(num_particles, action_dim, hidden_dim).to(device)
+            self.target_critic = DDPGCriticParticle(num_particles, action_dim, hidden_dim).to(device)
+        elif obs_shape is not None:
+            # 深度图输入
+            self.actor = DDPGActorDepth(obs_shape, action_dim, hidden_dim).to(device)
+            self.target_actor = DDPGActorDepth(obs_shape, action_dim, hidden_dim).to(device)
+            self.critic = DDPGCriticDepth(obs_shape, action_dim, hidden_dim).to(device)
+            self.target_critic = DDPGCriticDepth(obs_shape, action_dim, hidden_dim).to(device)
+        else:
+            raise ValueError("Must specify either num_particles or obs_shape")
+        
+        # 初始化目标网络
+        self._hard_update(self.target_actor, self.actor)
+        self._hard_update(self.target_critic, self.critic)
+        
+        # 优化器
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        
+        # 经验回放缓冲区
+        self.replay_buffer = ReplayBuffer(
+            capacity=buffer_capacity,
+            obs_dim_or_shape=num_particles or obs_shape,
+            action_dim=action_dim
+        )
+        
+        # OU噪声
+        self.noise = OUNoise(action_dim, sigma=noise_std)
+        
+        # 打印网络参数量
+        self.print_network_parameters()
+        
+    def select_action(self, state: np.ndarray, add_noise: bool = True, deterministic: bool = False) -> np.ndarray:
+        """选择动作"""
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            action = self.actor(state_tensor).cpu().numpy()[0]
+            
+            if add_noise and not deterministic:
+                noise = self.noise.sample()
+                action = np.clip(action + noise, 0.0, 1.0)
+            
+            return action
+    
+    def store_experience(self, state: np.ndarray, action: np.ndarray, reward: float, 
+                        next_state: np.ndarray, done: bool):
+        """存储经验到回放缓冲区"""
+        self.replay_buffer.add(state, action, reward, next_state, done)
+    
+    def update(self) -> Dict[str, float]:
+        """更新网络参数"""
+        if len(self.replay_buffer) < self.batch_size:
+            return {}
+        
+        # 从回放缓冲区采样
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        
+        states = torch.FloatTensor(states).to(self.device)
+        actions = torch.FloatTensor(actions).to(self.device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+        next_states = torch.FloatTensor(next_states).to(self.device)
+        dones = torch.BoolTensor(dones).unsqueeze(1).to(self.device)
+        
+        # 更新Critic
+        with torch.no_grad():
+            next_actions = self.target_actor(next_states)
+            target_q = self.target_critic(next_states, next_actions)
+            target_q = rewards + (self.gamma * target_q * ~dones)
+        
+        current_q = self.critic(states, actions)
+        critic_loss = F.mse_loss(current_q, target_q)
+        
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        # 更新Actor
+        new_actions = self.actor(states)
+        actor_loss = -self.critic(states, new_actions).mean()
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # 软更新目标网络
+        self._soft_update(self.target_actor, self.actor)
+        self._soft_update(self.target_critic, self.critic)
+        
+        return {
+            'critic_loss': critic_loss.item(),
+            'actor_loss': actor_loss.item(),
+            'q_value': current_q.mean().item()
+        }
+    
+    def reset_noise(self):
+        """重置噪声"""
+        self.noise.reset()
+    
+    def print_network_parameters(self):
+        """打印DDPG网络参数量"""
+        actor_params = sum(p.numel() for p in self.actor.parameters())
+        target_actor_params = sum(p.numel() for p in self.target_actor.parameters())
+        critic_params = sum(p.numel() for p in self.critic.parameters())
+        target_critic_params = sum(p.numel() for p in self.target_critic.parameters())
+        
+        total_params = actor_params + target_actor_params + critic_params + target_critic_params
+        
+        print(f"=== DDPG网络参数统计 ===")
+        print(f"Actor网络: {actor_params:,} 参数")
+        print(f"Target Actor网络: {target_actor_params:,} 参数")
+        print(f"Critic网络: {critic_params:,} 参数")
+        print(f"Target Critic网络: {target_critic_params:,} 参数")
+        print(f"总参数量: {total_params:,}")
+        print(f"参数大小: {total_params * 4 / 1024 / 1024:.2f} MB (假设float32)")
+        print("=" * 30)
+    
+    def _soft_update(self, target, source):
+        """软更新目标网络"""
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
+    
+    def _hard_update(self, target, source):
+        """硬更新目标网络"""
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(param.data)
+    
+    def save(self, filepath: str):
+        """保存模型"""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'target_actor_state_dict': self.target_actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'target_critic_state_dict': self.target_critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+        }, filepath)
+        print(f"DDPG模型已保存至: {filepath}")
+    
+    def load(self, filepath: str):
+        """加载模型"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.target_actor.load_state_dict(checkpoint['target_actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        print(f"DDPG模型已从 {filepath} 加载")
+
+# DQN算法实现
+class DQNNetwork(nn.Module):
+    """DQN网络 - 输入粒子坐标，为每个粒子输出Q值"""
+    
+    def __init__(self, num_particles: int, hidden_dim: int = 512):
+        super(DQNNetwork, self).__init__()
+        self.num_particles = num_particles
+        
+        # 粒子特征提取层 - 处理每个粒子的3D坐标
+        self.particle_encoder = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        # 全局特征聚合
+        particle_feature_dim = num_particles * 64
+        self.global_encoder = nn.Sequential(
+            nn.Linear(particle_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # 为pick和place分别输出Q值
+        self.pick_q_head = nn.Linear(hidden_dim, num_particles)  # 为每个粒子输出pick的Q值
+        self.place_q_head = nn.Linear(hidden_dim, num_particles)  # 为每个粒子输出place的Q值
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.orthogonal_(m.weight, 1.0)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        
+        # 输出层使用较小的初始化
+        torch.nn.init.uniform_(self.pick_q_head.weight, -3e-3, 3e-3)
+        torch.nn.init.uniform_(self.place_q_head.weight, -3e-3, 3e-3)
+        if self.pick_q_head.bias is not None:
+            torch.nn.init.uniform_(self.pick_q_head.bias, -3e-3, 3e-3)
+        if self.place_q_head.bias is not None:
+            torch.nn.init.uniform_(self.place_q_head.bias, -3e-3, 3e-3)
+        
+    def forward(self, obs: torch.Tensor) -> tuple:
+        """
+        前向传播
+        Args:
+            obs: shape (batch_size, num_particles, 3)
+        Returns:
+            pick_q_values: shape (batch_size, num_particles) - 每个粒子作为pick点的Q值
+            place_q_values: shape (batch_size, num_particles) - 每个粒子作为place点的Q值
+        """
+        batch_size = obs.shape[0]
+        
+        # 处理每个粒子的特征
+        particles_flat = obs.reshape(-1, 3)  # (batch_size * num_particles, 3)
+        particle_features = self.particle_encoder(particles_flat)  # (batch_size * num_particles, 64)
+        particle_features = particle_features.reshape(batch_size, self.num_particles, 64)
+        global_features = particle_features.reshape(batch_size, -1)  # (batch_size, num_particles * 64)
+        
+        # 全局特征编码
+        features = self.global_encoder(global_features)  # (batch_size, hidden_dim)
+        
+        # 输出每个粒子的Q值
+        pick_q_values = self.pick_q_head(features)  # (batch_size, num_particles)
+        place_q_values = self.place_q_head(features)  # (batch_size, num_particles)
+        
+        return pick_q_values, place_q_values
+
+
+class ReplayBufferDQN:
+    """DQN专用的经验回放缓冲区"""
+    
+    def __init__(self, capacity: int, num_particles: int):
+        self.capacity = capacity
+        self.num_particles = num_particles
+        self.buffer = deque(maxlen=capacity)
+    
+    def add(self, state, action, reward, next_state, done):
+        """添加经验到缓冲区"""
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size: int):
+        """从缓冲区采样经验"""
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        return (
+            np.array(states),      # (batch_size, num_particles, 3)
+            np.array(actions),     # (batch_size, 2) - [pick_idx, place_idx]
+            np.array(rewards),     # (batch_size,)
+            np.array(next_states), # (batch_size, num_particles, 3)
+            np.array(dones)        # (batch_size,)
+        )
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DQNAgent:
+    """DQN算法实现 - 专为离散动作空间设计"""
+    
+    def __init__(self, 
+                 num_particles: int,
+                 lr: float = 1e-3,
+                 gamma: float = 0.99,
+                 epsilon_start: float = 1.0,
+                 epsilon_end: float = 0.01,
+                 epsilon_decay: int = 10000,
+                 hidden_dim: int = 512,
+                 buffer_capacity: int = 100000,
+                 batch_size: int = 256,
+                 target_update_frequency: int = 1000,
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        
+        self.device = device
+        self.num_particles = num_particles
+        self.gamma = gamma
+        self.epsilon_start = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.batch_size = batch_size
+        self.target_update_frequency = target_update_frequency
+        
+        # 网络初始化
+        self.q_network = DQNNetwork(num_particles, hidden_dim).to(device)
+        self.target_network = DQNNetwork(num_particles, hidden_dim).to(device)
+        
+        # 初始化目标网络
+        self._hard_update()
+        
+        # 优化器
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        
+        # 经验回放缓冲区
+        self.replay_buffer = ReplayBufferDQN(buffer_capacity, num_particles)
+        
+        # 训练统计
+        self.total_steps = 0
+        self.update_count = 0
+        
+        # 打印网络参数量
+        self.print_network_parameters()
+        
+    def select_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
+        """
+        选择动作 - epsilon-greedy策略
+        Args:
+            state: shape (num_particles, 3)
+            deterministic: 是否使用确定性策略（用于评估）
+        Returns:
+            action: shape (2,) - [pick_idx, place_idx]
+        """
+        # 计算当前epsilon
+        if deterministic:
+            epsilon = 0.0
+        else:
+            epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+                     np.exp(-1. * self.total_steps / self.epsilon_decay)
+        
+        if np.random.random() < epsilon:
+            # 随机选择动作
+            pick_idx = np.random.randint(0, self.num_particles)
+            place_idx = np.random.randint(0, self.num_particles)
+            return np.array([pick_idx, place_idx], dtype=np.float32)
+        else:
+            # 使用Q网络选择动作
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                pick_q_values, place_q_values = self.q_network(state_tensor)
+                
+                pick_idx = torch.argmax(pick_q_values, dim=1).cpu().numpy()[0]
+                place_idx = torch.argmax(place_q_values, dim=1).cpu().numpy()[0]
+                
+                return np.array([pick_idx, place_idx], dtype=np.float32)
+    
+    def store_transition(self, state: np.ndarray, action: np.ndarray, reward: float, 
+                        next_state: np.ndarray, done: bool):
+        """存储经验到回放缓冲区"""
+        self.replay_buffer.add(state, action, reward, next_state, done)
+        self.total_steps += 1
+    
+    def update(self) -> Dict[str, float]:
+        """更新Q网络"""
+        if len(self.replay_buffer) < self.batch_size:
+            return {}
+        
+        # 从回放缓冲区采样
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        
+        states = torch.FloatTensor(states).to(self.device)
+        actions = torch.LongTensor(actions).to(self.device)  # 转换为LongTensor用于索引
+        rewards = torch.FloatTensor(rewards).to(self.device)
+        next_states = torch.FloatTensor(next_states).to(self.device)
+        dones = torch.BoolTensor(dones).to(self.device)
+        
+        # 当前Q值
+        pick_q_values, place_q_values = self.q_network(states)
+        
+        # 选择对应动作的Q值
+        pick_actions = actions[:, 0]  # pick动作索引
+        place_actions = actions[:, 1]  # place动作索引
+        
+        current_pick_q = pick_q_values.gather(1, pick_actions.unsqueeze(1)).squeeze(1)
+        current_place_q = place_q_values.gather(1, place_actions.unsqueeze(1)).squeeze(1)
+        
+        # 目标Q值 (Double DQN)
+        with torch.no_grad():
+            # 使用主网络选择动作
+            next_pick_q, next_place_q = self.q_network(next_states)
+            next_pick_actions = torch.argmax(next_pick_q, dim=1)
+            next_place_actions = torch.argmax(next_place_q, dim=1)
+            
+            # 使用目标网络评估动作
+            target_next_pick_q, target_next_place_q = self.target_network(next_states)
+            target_next_pick_q = target_next_pick_q.gather(1, next_pick_actions.unsqueeze(1)).squeeze(1)
+            target_next_place_q = target_next_place_q.gather(1, next_place_actions.unsqueeze(1)).squeeze(1)
+            
+            # 组合pick和place的Q值（取平均）
+            target_next_q = (target_next_pick_q + target_next_place_q) / 2.0
+            target_q = rewards + (self.gamma * target_next_q * ~dones)
+        
+        # 组合当前pick和place的Q值（取平均）
+        current_q = (current_pick_q + current_place_q) / 2.0
+        
+        # 计算损失
+        loss = F.mse_loss(current_q, target_q)
+        
+        # 优化
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
+        self.optimizer.step()
+        
+        # 更新目标网络
+        self.update_count += 1
+        if self.update_count % self.target_update_frequency == 0:
+            self._hard_update()
+        
+        # 计算当前epsilon
+        epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+                 np.exp(-1. * self.total_steps / self.epsilon_decay)
+        
+        return {
+            'q_loss': loss.item(),
+            'q_value_mean': current_q.mean().item(),
+            'epsilon': epsilon,
+            'pick_q_mean': current_pick_q.mean().item(),
+            'place_q_mean': current_place_q.mean().item(),
+            'target_q_mean': target_q.mean().item()
+        }
+    
+    def print_network_parameters(self):
+        """打印DQN网络参数量"""
+        q_network_params = sum(p.numel() for p in self.q_network.parameters())
+        target_network_params = sum(p.numel() for p in self.target_network.parameters())
+        
+        total_params = q_network_params + target_network_params
+        
+        print(f"=== DQN网络参数统计 ===")
+        print(f"Q网络: {q_network_params:,} 参数")
+        print(f"目标网络: {target_network_params:,} 参数")
+        print(f"总参数量: {total_params:,}")
+        print(f"参数大小: {total_params * 4 / 1024 / 1024:.2f} MB (假设float32)")
+        print("=" * 30)
+    
+    def _hard_update(self):
+        """硬更新目标网络"""
+        self.target_network.load_state_dict(self.q_network.state_dict())
+    
+    def save(self, filepath: str):
+        """保存模型"""
+        torch.save({
+            'q_network_state_dict': self.q_network.state_dict(),
+            'target_network_state_dict': self.target_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'total_steps': self.total_steps,
+            'update_count': self.update_count
+        }, filepath)
+        print(f"DQN模型已保存至: {filepath}")
+    
+    def load(self, filepath: str):
+        """加载模型"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
+        self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.total_steps = checkpoint.get('total_steps', 0)
+        self.update_count = checkpoint.get('update_count', 0)
+        print(f"DQN模型已从 {filepath} 加载")

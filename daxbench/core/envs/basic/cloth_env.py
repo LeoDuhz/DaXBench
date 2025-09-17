@@ -197,6 +197,7 @@ class ClothEnv:
         act1_down = arm1_pick - state.primitive0[:3]
         act1_down = jnp.zeros(4).at[:3].set(act1_down)  # suction = 0 (强吸)
         act1_down = act1_down[None, ...].repeat(5, axis=0) / 5
+        act1_down= act1_down.at[..., 3].set(1)
 
 
         lift_height = 0.1

@@ -29,11 +29,12 @@ if __name__ == "__main__":
     task_dir = os.path.join(oracle_base_dir, task)
     task_func = globals()[task]()
     conf = DefaultConf()
-    if task.startswith('T') or task.startswith('P'):
-        conf.N = 150
+    # if task.startswith('T') or task.startswith('P'):
+    #     conf.N = 150
     
-    conf.batch_size = 20
-    conf.id_range = list(range(0, 20))
+    conf.id_range = list(range(0, 50))
+    conf.batch_size = len(conf.id_range)
+
     if only_render_first_image:
         conf.id_range = list(range(0, 100))
         conf.batch_size = len(conf.id_range)

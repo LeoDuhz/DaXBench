@@ -592,7 +592,11 @@ class FoldEnv(ClothEnv):
             current_particles_j = jnp.array(current_particles)
             current_subgoal_j = jnp.array(current_subgoal)
             # print(current_particles_j.shape, current_subgoal_j.shape)  
-            distance = jnp.mean(jnp.linalg.norm(current_particles_j - current_subgoal_j, axis=-1))
+            # distance = jnp.mean(jnp.linalg.norm(current_particles_j - current_subgoal_j, axis=-1))
+            #chamfer distance
+            from daxbench.core.utils.util import calc_chamfer
+        
+            distance = calc_chamfer(current_particles_j[None, ...], current_subgoal_j)
             # print(distance)
             # print(distance)
             # 奖励函数：距离越小奖励越大
@@ -665,7 +669,10 @@ class FoldEnv(ClothEnv):
             # 计算距离
             current_particles_j = jnp.array(current_particles)
             current_subgoal_j = jnp.array(current_subgoal)
-            distance = jnp.mean(jnp.linalg.norm(current_particles_j - current_subgoal_j, axis=-1))
+            # distance = jnp.mean(jnp.linalg.norm(current_particles_j - current_subgoal_j, axis=-1))
+            from daxbench.core.utils.util import calc_chamfer
+        
+            distance = calc_chamfer(current_particles_j[None, ...], current_subgoal_j)
             current_distances[i] = float(distance)
             self.distances[i] = distance
             # 检查是否达到子目标

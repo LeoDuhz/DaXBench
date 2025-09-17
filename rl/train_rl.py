@@ -61,7 +61,7 @@ class RLTrainer:
             elif env_conf.task.startswith('T'):
                 env_conf.id_range = [6,11,19]
             elif env_conf.task.startswith('P'):
-                env_conf.id_range = list(range(0, 1))
+                env_conf.id_range = [0, 1]
             elif env_conf.task.startswith('R'):
                 env_conf.id_range = [0, 2]
         else:
@@ -70,7 +70,7 @@ class RLTrainer:
             elif env_conf.task.startswith('T'):
                 env_conf.id_range = [6,11,19]
             elif env_conf.task.startswith('P'):
-                env_conf.id_range = list(range(0, 1))
+                env_conf.id_range = [0, 1]
             elif env_conf.task.startswith('R'):
                 env_conf.id_range = [0, 2]
         print(env_conf.task)
@@ -854,7 +854,7 @@ def main():
                        help='DQN算法初始epsilon值')
     parser.add_argument('--epsilon_end', type=float, default=0.01,
                        help='DQN算法最终epsilon值')
-    parser.add_argument('--epsilon_decay', type=int, default=10000,
+    parser.add_argument('--epsilon_decay', type=int, default=100000,
                        help='DQN算法epsilon衰减步数')
     parser.add_argument('--target_update_frequency', type=int, default=1000,
                        help='DQN算法目标网络更新频率')
